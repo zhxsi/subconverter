@@ -818,7 +818,12 @@ std::string proxyToClash(std::vector<Proxy> &nodes, const std::string &base_conf
     proxyToClash(nodes, yamlnode, extra_proxy_group, clashR, ext);
 
     if(ext.nodelist)
-        return YAML::Dump(yamlnode);
+    {
+        std::string output = YAML::Dump(yamlnode);
+        // 为 short-id 添加引号，避免被解析为数字
+        output = regReplace(output, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
+        return output;
+    }
 
     /*
     if(ext.enable_rule_generator)
@@ -827,7 +832,12 @@ std::string proxyToClash(std::vector<Proxy> &nodes, const std::string &base_conf
     return YAML::Dump(yamlnode);
     */
     if(!ext.enable_rule_generator)
-        return YAML::Dump(yamlnode);
+    {
+        std::string output = YAML::Dump(yamlnode);
+        // 为 short-id 添加引号，避免被解析为数字
+        output = regReplace(output, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
+        return output;
+    }
 
     if(!ext.managed_config_prefix.empty() || ext.clash_script)
     {
@@ -840,11 +850,17 @@ std::string proxyToClash(std::vector<Proxy> &nodes, const std::string &base_conf
         }
 
         renderClashScript(yamlnode, ruleset_content_array, ext.managed_config_prefix, ext.clash_script, ext.overwrite_original_rules, ext.clash_classical_ruleset);
-        return YAML::Dump(yamlnode);
+        std::string output = YAML::Dump(yamlnode);
+        // 为 short-id 添加引号，避免被解析为数字
+        output = regReplace(output, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
+        return output;
     }
 
     std::string output_content = rulesetToClashStr(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.clash_new_field_name);
-    output_content.insert(0, YAML::Dump(yamlnode));
+    std::string yaml_dump = YAML::Dump(yamlnode);
+    // 为 short-id 添加引号，避免被解析为数字
+    yaml_dump = regReplace(yaml_dump, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
+    output_content.insert(0, yaml_dump);
     //rulesetToClash(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.clash_new_field_name);
     //std::string output_content = YAML::Dump(yamlnode);
 
@@ -1076,7 +1092,7 @@ std::string proxyToSurge(std::vector<Proxy> &nodes, const std::string &base_conf
                 continue;
             proxy = "hysteria, " + hostname + ", " + port + ", password=" + password;
             if(x.DownSpeed)
-                proxy += ", download-bandwidth=" + x.DownSpeed;
+                proxy += ", download-bandwidth=" + std::to_string(x.DownSpeed);
             if(!scv.is_undef())
                 proxy += ",skip-cert-verify=" + std::string(scv.get() ? "true" : "false");
             if(!x.Fingerprint.empty())
