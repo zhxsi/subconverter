@@ -1,5 +1,5 @@
 FROM alpine:3.16 AS builder
-LABEL maintainer="metacubex.official@gmail.com"
+LABEL maintainer="ZHXSI00@gmail.com"
 ARG THREADS="4"
 ARG SHA=""
 
@@ -35,7 +35,7 @@ RUN set -xe && \
     cmake -DCMAKE_CXX_STANDARD=11 . && \
     make install -j $THREADS && \
     cd .. && \
-    git clone https://github.com/metacubex/subconverter --depth=1 && \
+    git clone https://github.com/zhxsi/subconverter --depth=1 && \
     cd subconverter && \
     [ -n "$SHA" ] && sed -i 's/\(v[0-9]\.[0-9]\.[0-9]\)/\1-'"$SHA"'/' src/version.h;\
     python3 -m ensurepip && \
@@ -46,7 +46,7 @@ RUN set -xe && \
 
 # build final image
 FROM alpine:3.16
-LABEL maintainer="metacubex.official@gmail.com"
+LABEL maintainer="ZHXSI00@gmail.com"
 
 RUN apk add --no-cache --virtual subconverter-deps pcre2 libcurl yaml-cpp
 
@@ -54,11 +54,21 @@ COPY --from=builder /subconverter/subconverter /usr/bin/
 COPY --from=builder /subconverter/base /base/
 
 ENV TZ=Africa/Abidjan
-RUN ln -sf /usr/share/zoneinfo/$TZ /etc/localtime
-RUN echo $TZ > /etc/timezone
+ENV SAVE_TOKEN=""
 
-# set entry
+RUN ln -sf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone
+
+# 创建启动脚本
+RUN echo '#!/bin/sh' > /usr/local/bin/entrypoint.sh && \
+    echo 'if [ -n "$SAVE_TOKEN" ] && [ -f /base/gistconf.ini ]; then' >> /usr/local/bin/entrypoint.sh && \
+    echo '  sed -i "s/^;token = your_personal_token_here/token = $SAVE_TOKEN/" /base/gistconf.ini' >> /usr/local/bin/entrypoint.sh && \
+    echo '  sed -i "s/^token = .*/token = $SAVE_TOKEN/" /base/gistconf.ini' >> /usr/local/bin/entrypoint.sh && \
+    echo 'fi' >> /usr/local/bin/entrypoint.sh && \
+    echo 'exec subconverter' >> /usr/local/bin/entrypoint.sh && \
+    chmod +x /usr/local/bin/entrypoint.sh
+
 WORKDIR /base
-CMD subconverter
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 EXPOSE 25500/tcp
