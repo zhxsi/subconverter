@@ -341,6 +341,7 @@ http://127.0.0.1:25500/sub?target=%TARGET%&url=%URL%&emoji=%EMOJI%····
 | tls13         |  可选 | true / false              | 用于设置是否为节点增加tls1.3开启参数                                                                                                                                                                                       |
 | new_name      |  可选 | true / false              | 如果设置为 true，则将启用 Clash 的新组名称 (proxies, proxy-groups, rules)                                                                                                                                                  |
 | ua            |  可选 | shadowrocket%2F2.2.65     | 用于自定义User-Agent字符串，需要经过 [URLEncode](https://www.urlencoder.org/) 处理。如果不指定，将使用默认的User-Agent                                                                                                               |
+| referer       |  可选 | none / pass / https%3A... | 用于控制获取订阅时的 Referer 请求头。默认透传原请求中的 Referer；设为 `none` / `off` / `false` / `disable` 时不传；设为 `pass` / `passthrough` / `inherit` 时透传；其他值视为自定义 Referer，需要经过 [URLEncode](https://www.urlencoder.org/) 处理 |
 
 举个例子：
 
@@ -379,6 +380,30 @@ url=https%3A%2F%2Fexample.com%2Fsubscribe
 http://127.0.0.1:25500/sub?target=clash&ua=shadowrocket%2F2.2.65&url=https%3A%2F%2Fexample.com%2Fsubscribe
 
 这样在获取订阅时就会使用指定的User-Agent字符串。
+```
+
+**控制Referer请求头的例子：**
+
+```txt
+有订阅 `https://example.com/subscribe`，想转换成 Clash 的订阅，并且不向上游传递 Referer
+
+首先确认需要用到的参数：
+target=clash 、 referer=none
+url=https://example.com/subscribe
+
+然后将需要 URLEncode 的部分进行处理：
+url=https%3A%2F%2Fexample.com%2Fsubscribe
+
+接着将所有元素进行拼接：
+http://127.0.0.1:25500/sub?target=clash&referer=none&url=https%3A%2F%2Fexample.com%2Fsubscribe
+```
+
+```txt
+如果想自定义 Referer 为 `https://sk.zhxsi.top/664aft`
+
+referer=https%3A%2F%2Fsk.zhxsi.top%2F664aft
+
+http://127.0.0.1:25500/sub?target=clash&referer=https%3A%2F%2Fsk.zhxsi.top%2F664aft&url=https%3A%2F%2Fexample.com%2Fsubscribe
 ```
 
 ### 配置档案

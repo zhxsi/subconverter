@@ -152,6 +152,20 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID, parse_
         {
             custom_headers["User-Agent"] = *parse_set.custom_user_agent;
         }
+
+        if(parse_set.custom_referer && !parse_set.custom_referer->empty())
+        {
+            std::string referer = trim(*parse_set.custom_referer);
+            std::string referer_mode = toLower(referer);
+            if(referer_mode == "none" || referer_mode == "off" || referer_mode == "false" || referer_mode == "disable" || referer_mode == "disabled")
+            {
+                custom_headers.erase("Referer");
+            }
+            else if(referer_mode != "pass" && referer_mode != "passthrough" && referer_mode != "inherit" && referer_mode != "true")
+            {
+                custom_headers["Referer"] = referer;
+            }
+        }
         
         strSub = webGet(link, proxy, global.cacheSubscription, &extra_headers, &custom_headers);
         /*
