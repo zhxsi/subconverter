@@ -334,7 +334,8 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     std::string argCustomGroups = urlSafeBase64Decode(getUrlArg(argument, "groups")), argCustomRulesets = urlSafeBase64Decode(getUrlArg(argument, "ruleset")), argExternalConfig = getUrlArg(argument, "config");
     std::string argDeviceID = getUrlArg(argument, "dev_id"), argFilename = getUrlArg(argument, "filename"), argUpdateInterval = getUrlArg(argument, "interval"), argUpdateStrict = getUrlArg(argument, "strict");
     std::string argRenames = getUrlArg(argument, "rename"), argFilterScript = getUrlArg(argument, "filter_script");
-    std::string argUserAgent = getUrlArg(argument, "ua");
+    std::string argUserAgent = urlDecode(getUrlArg(argument, "ua"));
+    std::string argReferer = urlDecode(getUrlArg(argument, "referer"));
 
     /// switches with default value
     tribool argUpload = getUrlArg(argument, "upload"), argEmoji = getUrlArg(argument, "emoji"), argAddEmoji = getUrlArg(argument, "add_emoji"), argRemoveEmoji = getUrlArg(argument, "remove_emoji");
@@ -612,6 +613,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     parse_set.authorized = authorized;
     parse_set.request_header = &request.headers;
     parse_set.custom_user_agent = &argUserAgent;
+    parse_set.custom_referer = &argReferer;
     parse_set.js_runtime = ext.js_runtime;
     parse_set.js_context = ext.js_context;
 
