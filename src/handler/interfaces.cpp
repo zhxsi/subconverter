@@ -439,6 +439,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     ext.quanx_dev_id = !argDeviceID.empty() ? argDeviceID : global.quanXDevID;
     ext.enable_rule_generator = global.enableRuleGen;
     ext.overwrite_original_rules = global.overwriteOriginalRules;
+    ext.enable_rule_dedup = global.enableRuleDedup;
     if(!argExpandRulesets)
         ext.managed_config_prefix = global.managedConfigPrefix;
 
@@ -451,6 +452,9 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         writeLog(0, "External configuration file provided. Loading...", LOG_LEVEL_INFO);
         ExternalConfig extconf;
         extconf.tpl_args = &tpl_args;
+        // An external configuration only overrides the global value when it
+        // explicitly provides enable_rule_dedup.
+        extconf.enable_rule_dedup = ext.enable_rule_dedup;
         if(loadExternalConfig(argExternalConfig, extconf) == 0)
         {
             if(!ext.nodelist)
@@ -473,6 +477,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
                         lCustomProxyGroups = extconf.custom_proxy_group;
                     ext.enable_rule_generator = extconf.enable_rule_generator;
                     ext.overwrite_original_rules = extconf.overwrite_original_rules;
+                    ext.enable_rule_dedup = extconf.enable_rule_dedup;
                 }
             }
             if(!extconf.rename.empty())
@@ -602,6 +607,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     string_array urls;
     std::vector<Proxy> nodes, insert_nodes;
     int groupID = 0;
+    size_t totalLinks = 0, skippedLinks = 0;
 
     parse_settings parse_set;
     parse_set.proxy = &proxy;
@@ -624,19 +630,15 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         // Remove empty urls
         urls.erase(std::remove_if(urls.begin(), urls.end(), [](const std::string& str) { return str.empty(); }), urls.end());
         importItems(urls, true);
+        totalLinks += urls.size();
         for(std::string &x : urls)
         {
             x = regTrim(x);
             writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
             if(addNodes(x, insert_nodes, groupID, parse_set) == -1)
             {
-                if(global.skipFailedLinks)
-                    writeLog(0, "The following link doesn't contain any valid node info: " + x, LOG_LEVEL_WARNING);
-                else
-                {
-                    *status_code = 400;
-                    return "The following link doesn't contain any valid node info: " + x;
-                }
+                writeLog(0, "Skipping link without valid node info: " + x, LOG_LEVEL_WARNING);
+                skippedLinks++;
             }
             groupID--;
         }
@@ -645,6 +647,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     // Remove empty urls
     urls.erase(std::remove_if(urls.begin(), urls.end(), [](const std::string& str) { return str.empty(); }), urls.end());
     importItems(urls, true);
+    totalLinks += urls.size();
     groupID = 0;
     for(std::string &x : urls)
     {
@@ -653,21 +656,17 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
         if(addNodes(x, nodes, groupID, parse_set) == -1)
         {
-            if(global.skipFailedLinks)
-                writeLog(0, "The following link doesn't contain any valid node info: " + x, LOG_LEVEL_WARNING);
-            else
-            {
-                *status_code = 400;
-                return "The following link doesn't contain any valid node info: " + x;
-            }
+            writeLog(0, "Skipping link without valid node info: " + x, LOG_LEVEL_WARNING);
+            skippedLinks++;
         }
         groupID++;
     }
+    writeLog(0, "Subscription conversion summary: links=" + std::to_string(totalLinks) + ", succeeded=" + std::to_string(totalLinks - skippedLinks) + ", skipped=" + std::to_string(skippedLinks) + ", valid nodes=" + std::to_string(nodes.size() + insert_nodes.size()) + ".", LOG_LEVEL_INFO);
     //exit if found nothing
     if(nodes.empty() && insert_nodes.empty())
     {
         *status_code = 400;
-        return "No nodes were found!";
+        return "No valid nodes were found in any subscription link.";
     }
     if(!subInfo.empty() && argAppendUserinfo.get(global.appendUserinfo))
         response.headers.emplace("Subscription-UserInfo", subInfo);
@@ -1094,27 +1093,25 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS)
     parse_set.request_header = &request.headers;
     parse_set.sub_info = &subInfo;
     parse_set.authorized = !global.APIMode;
+    size_t skippedLinks = 0;
     for(std::string &x : links)
     {
         //std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
         writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
         if(addNodes(x, nodes, 0, parse_set) == -1)
         {
-            if(global.skipFailedLinks)
-                writeLog(0, "The following link doesn't contain any valid node info: " + x, LOG_LEVEL_WARNING);
-            else
-            {
-                *status_code = 400;
-                return "The following link doesn't contain any valid node info: " + x;
-            }
+            writeLog(0, "Skipping link without valid node info: " + x, LOG_LEVEL_WARNING);
+            skippedLinks++;
         }
     }
+
+    writeLog(0, "Surge configuration conversion summary: links=" + std::to_string(links.size()) + ", succeeded=" + std::to_string(links.size() - skippedLinks) + ", skipped=" + std::to_string(skippedLinks) + ", valid nodes=" + std::to_string(nodes.size()) + ".", LOG_LEVEL_INFO);
 
     //exit if found nothing
     if(nodes.empty())
     {
         *status_code = 400;
-        return "No nodes were found!";
+        return "No valid nodes were found in any subscription link.";
     }
 
     extra_settings ext;

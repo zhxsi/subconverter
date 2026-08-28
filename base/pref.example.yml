@@ -81,6 +81,7 @@ emojis:
 rulesets:
   enabled: true
   overwrite_original_rules: false
+  enable_rule_dedup: false
   update_ruleset_on_request: false
   rulesets:
 #  - {rule: "GEOIP,CN", group: "DIRECT"}
@@ -156,4 +157,3 @@ advanced:
   cache_ruleset: 21600
   script_clean_context: true
   async_fetch_ruleset: false
-  skip_failed_links: false

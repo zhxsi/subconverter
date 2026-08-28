@@ -1,4 +1,5 @@
 #include <string>
+#include <set>
 
 #include "handler/settings.h"
 #include "utils/logger.h"
@@ -17,6 +18,61 @@ string_array QuanXRuleTypes = {basic_types, "USER-AGENT", "HOST", "HOST-SUFFIX",
 string_array SurfRuleTypes = {basic_types, "IP-CIDR6", "PROCESS-NAME", "IN-PORT", "DEST-PORT", "SRC-IP"};
 string_array SingBoxRuleTypes = {basic_types, "IP-VERSION", "INBOUND", "PROTOCOL", "NETWORK", "GEOSITE", "SRC-GEOIP", "DOMAIN-REGEX", "PROCESS-NAME", "PROCESS-PATH", "PACKAGE-NAME", "PORT", "PORT-RANGE", "SRC-PORT", "SRC-PORT-RANGE", "USER", "USER-ID"};
 
+static bool isDuplicateRule(std::set<std::string> &seen_rules, const std::string &rule, bool enable_rule_dedup)
+{
+    if(!enable_rule_dedup)
+        return false;
+
+    string_view_array args;
+    split(args, rule, ',');
+    if(args.size() < 2)
+        return false;
+
+    // A policy is deliberately excluded: the first ruleset has precedence.
+    std::string key = toUpper(trimWhitespace(std::string(args[0]), true, true));
+    key += ",";
+    key += toLower(trimWhitespace(std::string(args[1]), true, true));
+    return !seen_rules.emplace(std::move(key)).second;
+}
+
+static std::string completeIPPrefix(const std::string &type, const std::string &address)
+{
+    if(address.find('/') != std::string::npos)
+        return address;
+
+    std::string ruleType = toUpper(type);
+    if(ruleType == "IP-CIDR" || ruleType == "SRC-IP-CIDR")
+        return address + "/32";
+    if(ruleType == "IP-CIDR6")
+        return address + "/128";
+    return address;
+}
+
+static std::string convertPlainIPRules(const std::string &content)
+{
+    std::stringstream input(content);
+    std::string line, output;
+    bool foundRule = false;
+    while(std::getline(input, line))
+    {
+        line = trimWhitespace(line, true, true);
+        if(line.empty() || line[0] == '#' || line[0] == ';')
+            continue;
+        if(line.find(',') != std::string::npos)
+            return {};
+
+        std::string address = line;
+        std::string::size_type slash = address.find('/');
+        std::string host = slash == std::string::npos ? address : address.substr(0, slash);
+        if(!isIPv4(host) && !isIPv6(host))
+            return {};
+        const std::string type = isIPv4(host) ? "IP-CIDR" : "IP-CIDR6";
+        output += type + "," + completeIPPrefix(type, address) + "\n";
+        foundRule = true;
+    }
+    return foundRule ? output : std::string();
+}
+
 std::string convertRuleset(const std::string &content, int type)
 {
     /// Target: Surge type,pattern[,flag]
@@ -26,7 +82,10 @@ std::string convertRuleset(const std::string &content, int type)
     std::string output, strLine;
 
     if(type == RULESET_SURGE)
-        return content;
+    {
+        std::string plainIPRules = convertPlainIPRules(content);
+        return plainIPRules.empty() ? content : plainIPRules;
+    }
 
     if(regFind(content, "^payload:\\r?\\n")) /// Clash
     {
@@ -63,7 +122,17 @@ std::string convertRuleset(const std::string &content, int type)
                 }
                 else
                 {
-                    if(strLine[0] == '.' || (lineSize >= 2 && strLine[0] == '+' && strLine[1] == '.')) /// suffix
+                    if(isIPv4(strLine))
+                    {
+                        output += "IP-CIDR,";
+                        strLine += "/32";
+                    }
+                    else if(isIPv6(strLine))
+                    {
+                        output += "IP-CIDR6,";
+                        strLine += "/128";
+                    }
+                    else if(strLine[0] == '.' || (lineSize >= 2 && strLine[0] == '+' && strLine[1] == '.')) /// suffix
                     {
                         bool keyword_flag = false;
                         while(endsWith(strLine, ".*"))
@@ -91,6 +160,43 @@ std::string convertRuleset(const std::string &content, int type)
     {
         output = regReplace(regReplace(content, "^(?i:host)", "DOMAIN", true), "^(?i:ip6-cidr)", "IP-CIDR6", true); //translate type
         output = regReplace(output, "^((?i:DOMAIN(?:-(?:SUFFIX|KEYWORD))?|IP-CIDR6?|USER-AGENT),)\\s*?(\\S*?)(?:,(?!no-resolve).*?)(,no-resolve)?$", "\\U$1\\E$2${3:-}", true); //remove group
+
+        // Normalize QuanX rules so bare IP addresses receive both a rule type
+        // and a host-length CIDR mask. Existing domain and non-IP rules are
+        // left untouched.
+        std::stringstream input(output);
+        std::string line;
+        output.clear();
+        while(std::getline(input, line))
+        {
+            std::string normalized = trimWhitespace(line, true, true);
+            if(!normalized.empty() && normalized[0] != '#' && normalized[0] != ';')
+            {
+                string_view_array fields;
+                split(fields, normalized, ',');
+                if(fields.size() == 1 && (isIPv4(normalized) || isIPv6(normalized)))
+                {
+                    const std::string type = isIPv4(normalized) ? "IP-CIDR" : "IP-CIDR6";
+                    normalized = type + "," + completeIPPrefix(type, normalized);
+                }
+                else if(fields.size() >= 2)
+                {
+                    const std::string type = toUpper(trimWhitespace(std::string(fields[0]), true, true));
+                    if(type == "IP-CIDR" || type == "IP-CIDR6" || type == "SRC-IP-CIDR")
+                    {
+                        std::string address = trimWhitespace(std::string(fields[1]), true, true);
+                        normalized = type + "," + completeIPPrefix(type, address);
+                        for(size_t i = 2; i < fields.size(); ++i)
+                        {
+                            normalized += ",";
+                            normalized += std::string(fields[i]);
+                        }
+                    }
+                }
+            }
+            output += normalized;
+            output += '\n';
+        }
         return output;
     }
 }
@@ -110,7 +216,7 @@ static std::string transformRuleToCommon(string_view_array &temp, const std::str
     {
         strLine = temp[0];
         strLine += ",";
-        strLine += temp[1];
+        strLine += completeIPPrefix(std::string(temp[0]), std::string(temp[1]));
         strLine += ",";
         strLine += group;
         if(temp.size() > 2 && (!no_resolve_only || temp[2] == "no-resolve"))
@@ -122,7 +228,7 @@ static std::string transformRuleToCommon(string_view_array &temp, const std::str
     return strLine;
 }
 
-void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_content_array, bool overwrite_original_rules, bool new_field_name)
+void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_content_array, bool overwrite_original_rules, bool enable_rule_dedup, bool new_field_name)
 {
     string_array allRules;
     std::string rule_group, retrieved_rules, strLine;
@@ -130,6 +236,7 @@ void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_
     const std::string field_name = new_field_name ? "rules" : "Rule";
     YAML::Node rules;
     size_t total_rules = 0;
+    std::set<std::string> seen_rules;
 
     if(!overwrite_original_rules && base_rule[field_name].IsDefined())
         rules = base_rule[field_name];
@@ -152,6 +259,8 @@ void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_
             if(startsWith(strLine, "FINAL"))
                 strLine.replace(0, 5, "MATCH");
             strLine = transformRuleToCommon(temp, strLine, rule_group);
+            if(isDuplicateRule(seen_rules, strLine, enable_rule_dedup))
+                continue;
             allRules.emplace_back(strLine);
             total_rules++;
             continue;
@@ -178,6 +287,8 @@ void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_
                 strLine = trimWhitespace(strLine);
             }
             strLine = transformRuleToCommon(temp, strLine, rule_group);
+            if(isDuplicateRule(seen_rules, strLine, enable_rule_dedup))
+                continue;
             allRules.emplace_back(strLine);
         }
     }
@@ -190,13 +301,14 @@ void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_
     base_rule[field_name] = rules;
 }
 
-std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_content_array, bool overwrite_original_rules, bool new_field_name)
+std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_content_array, bool overwrite_original_rules, bool enable_rule_dedup, bool new_field_name)
 {
     std::string rule_group, retrieved_rules, strLine;
     std::stringstream strStrm;
     const std::string field_name = new_field_name ? "rules" : "Rule";
     std::string output_content = "\n" + field_name + ":\n";
     size_t total_rules = 0;
+    std::set<std::string> seen_rules;
 
     if(!overwrite_original_rules && base_rule[field_name].IsDefined())
     {
@@ -223,6 +335,8 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
             if(startsWith(strLine, "FINAL"))
                 strLine.replace(0, 5, "MATCH");
             strLine = transformRuleToCommon(temp, strLine, rule_group);
+            if(isDuplicateRule(seen_rules, strLine, enable_rule_dedup))
+                continue;
             output_content += "  - " + strLine + "\n";
             total_rules++;
             continue;
@@ -249,6 +363,8 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
                 strLine = trimWhitespace(strLine);
             }
             strLine = transformRuleToCommon(temp, strLine, rule_group);
+            if(isDuplicateRule(seen_rules, strLine, enable_rule_dedup))
+                continue;
             output_content += "  - " + strLine + "\n";
             total_rules++;
         }
@@ -256,12 +372,13 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
     return output_content;
 }
 
-void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_content_array, int surge_ver, bool overwrite_original_rules, const std::string &remote_path_prefix)
+void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_content_array, int surge_ver, bool overwrite_original_rules, bool enable_rule_dedup, const std::string &remote_path_prefix)
 {
     string_array allRules;
     std::string rule_group, rule_path, rule_path_typed, retrieved_rules, strLine;
     std::stringstream strStrm;
     size_t total_rules = 0;
+    std::set<std::string> seen_rules;
 
     switch(surge_ver) //other version: -3 for Surfboard, -4 for Loon
     {
@@ -319,6 +436,8 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
                     strLine = transformRuleToCommon(temp, strLine, rule_group);
             }
             strLine = replaceAllDistinct(strLine, ",,", ",");
+            if(isDuplicateRule(seen_rules, strLine, enable_rule_dedup))
+                continue;
             allRules.emplace_back(strLine);
             total_rules++;
             continue;
@@ -458,6 +577,8 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
                     if(!startsWith(strLine, "AND") && !startsWith(strLine, "OR") && !startsWith(strLine, "NOT"))
                         strLine = transformRuleToCommon(temp, strLine, rule_group);
                 }
+                if(isDuplicateRule(seen_rules, strLine, enable_rule_dedup))
+                    continue;
                 allRules.emplace_back(strLine);
                 total_rules++;
             }
@@ -517,12 +638,13 @@ static void appendSingBoxRule(std::vector<std::string_view> &args, rapidjson::Va
     rules | AppendToArray(realType.c_str(), rapidjson::Value(value.c_str(), value.size(), allocator), allocator);
 }
 
-void rulesetToSingBox(rapidjson::Document &base_rule, std::vector<RulesetContent> &ruleset_content_array, bool overwrite_original_rules)
+void rulesetToSingBox(rapidjson::Document &base_rule, std::vector<RulesetContent> &ruleset_content_array, bool overwrite_original_rules, bool enable_rule_dedup)
 {
     using namespace rapidjson_ext;
     std::string rule_group, retrieved_rules, strLine, final;
     std::stringstream strStrm;
     size_t total_rules = 0;
+    std::set<std::string> seen_rules;
     auto &allocator = base_rule.GetAllocator();
 
     rapidjson::Value rules(rapidjson::kArrayType);
@@ -563,6 +685,8 @@ void rulesetToSingBox(rapidjson::Document &base_rule, std::vector<RulesetContent
                 final = rule_group;
                 continue;
             }
+            if(isDuplicateRule(seen_rules, strLine, enable_rule_dedup))
+                continue;
             rules.PushBack(transformRuleToSingBox(temp, strLine, rule_group, allocator), allocator);
             total_rules++;
             continue;
@@ -589,6 +713,8 @@ void rulesetToSingBox(rapidjson::Document &base_rule, std::vector<RulesetContent
                 strLine.erase(strLine.find("//"));
                 strLine = trimWhitespace(strLine);
             }
+            if(isDuplicateRule(seen_rules, strLine, enable_rule_dedup))
+                continue;
             appendSingBoxRule(temp, rule, strLine, allocator);
         }
         if (rule.ObjectEmpty()) continue;

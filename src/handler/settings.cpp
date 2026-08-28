@@ -432,6 +432,7 @@ void readYAMLConf(YAML::Node &node)
         else
         {
             section["overwrite_original_rules"] >> global.overwriteOriginalRules;
+            section["enable_rule_dedup"] >> global.enableRuleDedup;
             section["update_ruleset_on_request"] >> global.updateRulesetOnRequest;
         }
         const char *ruleset_title = section["rulesets"].IsDefined() ? "rulesets" : "surge_ruleset";
@@ -561,7 +562,6 @@ void readYAMLConf(YAML::Node &node)
         }
         node["advanced"]["script_clean_context"] >> global.scriptCleanContext;
         node["advanced"]["async_fetch_ruleset"] >> global.asyncFetchRuleset;
-        node["advanced"]["skip_failed_links"] >> global.skipFailedLinks;
     }
     writeLog(0, "Load preference settings in YAML format completed.", LOG_LEVEL_INFO);
 }
@@ -683,6 +683,7 @@ void readTOMLConf(toml::value &root)
     find_if_exist(section_ruleset,
                   "enabled", global.enableRuleGen,
                   "overwrite_original_rules", global.overwriteOriginalRules,
+                  "enable_rule_dedup", global.enableRuleDedup,
                   "update_ruleset_on_request", global.updateRulesetOnRequest
     );
 
@@ -739,8 +740,7 @@ void readTOMLConf(toml::value &root)
                   "cache_config", cache_config,
                   "cache_ruleset", cache_ruleset,
                   "script_clean_context", global.scriptCleanContext,
-                  "async_fetch_ruleset", global.asyncFetchRuleset,
-                  "skip_failed_links", global.skipFailedLinks
+                  "async_fetch_ruleset", global.asyncFetchRuleset
     );
 
     if(global.printDbgInfo)
@@ -945,6 +945,7 @@ void readConf()
     if(global.enableRuleGen)
     {
         ini.get_bool_if_exist("overwrite_original_rules", global.overwriteOriginalRules);
+        ini.get_bool_if_exist("enable_rule_dedup", global.enableRuleDedup);
         ini.get_bool_if_exist("update_ruleset_on_request", global.updateRulesetOnRequest);
         if(ini.item_prefix_exist("ruleset"))
         {
@@ -1069,7 +1070,6 @@ void readConf()
     }
     ini.get_bool_if_exist("script_clean_context", global.scriptCleanContext);
     ini.get_bool_if_exist("async_fetch_ruleset", global.asyncFetchRuleset);
-    ini.get_bool_if_exist("skip_failed_links", global.skipFailedLinks);
 
     writeLog(0, "Load preference settings in INI format completed.", LOG_LEVEL_INFO);
 }
@@ -1092,6 +1092,7 @@ int loadExternalYAML(YAML::Node &node, ExternalConfig &ext)
 
     section["enable_rule_generator"] >> ext.enable_rule_generator;
     section["overwrite_original_rules"] >> ext.overwrite_original_rules;
+    section["enable_rule_dedup"] >> ext.enable_rule_dedup;
 
     const char *group_name = section["proxy_groups"].IsDefined() ? "proxy_groups" : "custom_proxy_group";
     if(section[group_name].size())
@@ -1155,6 +1156,7 @@ int loadExternalTOML(toml::value &root, ExternalConfig &ext)
     find_if_exist(section,
                   "enable_rule_generator", ext.enable_rule_generator,
                   "overwrite_original_rules", ext.overwrite_original_rules,
+                  "enable_rule_dedup", ext.enable_rule_dedup,
                   "clash_rule_base", ext.clash_rule_base,
                   "surge_rule_base", ext.surge_rule_base,
                   "surfboard_rule_base", ext.surfboard_rule_base,
@@ -1268,6 +1270,7 @@ int loadExternalConfig(std::string &path, ExternalConfig &ext)
     ini.get_if_exist("singbox_rule_base", ext.singbox_rule_base);
 
     ini.get_bool_if_exist("overwrite_original_rules", ext.overwrite_original_rules);
+    ini.get_bool_if_exist("enable_rule_dedup", ext.enable_rule_dedup);
     ini.get_bool_if_exist("enable_rule_generator", ext.enable_rule_generator);
 
     if(ini.item_prefix_exist("rename"))

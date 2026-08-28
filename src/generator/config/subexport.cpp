@@ -20,6 +20,11 @@
 #include "utils/stl_extra.h"
 #include "utils/urlencode.h"
 #include "utils/yamlcpp_extra.h"
+
+static std::string quoteClashShortId(const std::string &content)
+{
+    return regReplace(content, "(short-id:\\s*)([A-Za-z0-9_-]+)", "$1\\\"$2\\\"", true);
+}
 #include "nodemanip.h"
 #include "ruleconvert.h"
 
@@ -777,6 +782,8 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
             singlegroup["url"] = x.Url;
             if(x.Interval > 0)
                 singlegroup["interval"] = x.Interval;
+            if(x.Timeout > 0)
+                singlegroup["timeout"] = x.Timeout * 1000;
             if(x.Tolerance > 0)
                 singlegroup["tolerance"] = x.Tolerance;
             break;
@@ -843,26 +850,16 @@ std::string proxyToClash(std::vector<Proxy> &nodes, const std::string &base_conf
     proxyToClash(nodes, yamlnode, extra_proxy_group, clashR, ext);
 
     if(ext.nodelist)
-    {
-        std::string output = YAML::Dump(yamlnode);
-        // 为 short-id 添加引号，避免被解析为数字
-        output = regReplace(output, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
-        return output;
-    }
+        return quoteClashShortId(YAML::Dump(yamlnode));
 
     /*
     if(ext.enable_rule_generator)
-        rulesetToClash(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.clash_new_field_name);
+        rulesetToClash(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.clash_new_field_name);
 
     return YAML::Dump(yamlnode);
     */
     if(!ext.enable_rule_generator)
-    {
-        std::string output = YAML::Dump(yamlnode);
-        // 为 short-id 添加引号，避免被解析为数字
-        output = regReplace(output, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
-        return output;
-    }
+        return quoteClashShortId(YAML::Dump(yamlnode));
 
     if(!ext.managed_config_prefix.empty() || ext.clash_script)
     {
@@ -875,18 +872,12 @@ std::string proxyToClash(std::vector<Proxy> &nodes, const std::string &base_conf
         }
 
         renderClashScript(yamlnode, ruleset_content_array, ext.managed_config_prefix, ext.clash_script, ext.overwrite_original_rules, ext.clash_classical_ruleset);
-        std::string output = YAML::Dump(yamlnode);
-        // 为 short-id 添加引号，避免被解析为数字
-        output = regReplace(output, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
-        return output;
+        return quoteClashShortId(YAML::Dump(yamlnode));
     }
 
-    std::string output_content = rulesetToClashStr(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.clash_new_field_name);
-    std::string yaml_dump = YAML::Dump(yamlnode);
-    // 为 short-id 添加引号，避免被解析为数字
-    yaml_dump = regReplace(yaml_dump, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
-    output_content.insert(0, yaml_dump);
-    //rulesetToClash(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.clash_new_field_name);
+    std::string output_content = rulesetToClashStr(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.clash_new_field_name);
+    output_content.insert(0, quoteClashShortId(YAML::Dump(yamlnode)));
+    //rulesetToClash(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.clash_new_field_name);
     //std::string output_content = YAML::Dump(yamlnode);
 
     return output_content;
@@ -1238,7 +1229,7 @@ std::string proxyToSurge(std::vector<Proxy> &nodes, const std::string &base_conf
     }
 
     if(ext.enable_rule_generator)
-        rulesetToSurge(ini, ruleset_content_array, surge_ver, ext.overwrite_original_rules, ext.managed_config_prefix);
+        rulesetToSurge(ini, ruleset_content_array, surge_ver, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.managed_config_prefix);
 
     return ini.to_string();
 }
@@ -1600,7 +1591,7 @@ void proxyToQuan(std::vector<Proxy> &nodes, INIReader &ini, std::vector<RulesetC
     }
 
     if(ext.enable_rule_generator)
-        rulesetToSurge(ini, ruleset_content_array, -2, ext.overwrite_original_rules, "");
+        rulesetToSurge(ini, ruleset_content_array, -2, ext.overwrite_original_rules, ext.enable_rule_dedup, "");
 }
 
 std::string proxyToQuanX(std::vector<Proxy> &nodes, const std::string &base_conf, std::vector<RulesetContent> &ruleset_content_array, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext)
@@ -1938,7 +1929,7 @@ void proxyToQuanX(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Ruleset
     }
 
     if(ext.enable_rule_generator)
-        rulesetToSurge(ini, ruleset_content_array, -1, ext.overwrite_original_rules, ext.managed_config_prefix);
+        rulesetToSurge(ini, ruleset_content_array, -1, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.managed_config_prefix);
 }
 
 std::string proxyToSSD(std::vector<Proxy> &nodes, std::string &group, std::string &userinfo, extra_settings &ext)
@@ -2192,7 +2183,7 @@ void proxyToMellow(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Rulese
     }
 
     if(ext.enable_rule_generator)
-        rulesetToSurge(ini, ruleset_content_array, 0, ext.overwrite_original_rules, "");
+        rulesetToSurge(ini, ruleset_content_array, 0, ext.overwrite_original_rules, ext.enable_rule_dedup, "");
 }
 
 std::string proxyToLoon(std::vector<Proxy> &nodes, const std::string &base_conf, std::vector<RulesetContent> &ruleset_content_array, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext)
@@ -2426,7 +2417,7 @@ std::string proxyToLoon(std::vector<Proxy> &nodes, const std::string &base_conf,
     }
 
     if(ext.enable_rule_generator)
-        rulesetToSurge(ini, ruleset_content_array, -4, ext.overwrite_original_rules, ext.managed_config_prefix);
+        rulesetToSurge(ini, ruleset_content_array, -4, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.managed_config_prefix);
 
     return ini.to_string();
 }
@@ -2985,7 +2976,7 @@ std::string proxyToSingBox(std::vector<Proxy> &nodes, const std::string &base_co
     if(ext.nodelist || !ext.enable_rule_generator)
         return json | SerializeObject();
 
-    rulesetToSingBox(json, ruleset_content_array, ext.overwrite_original_rules);
+    rulesetToSingBox(json, ruleset_content_array, ext.overwrite_original_rules, ext.enable_rule_dedup);
 
     return json | SerializeObject();
 }
