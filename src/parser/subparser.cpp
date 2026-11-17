@@ -381,7 +381,7 @@ void vlessConstruct(
     }
     node.Fingerprint = fingerprint;
     node.Flow = flow;
-    node.ClientFingerprint = client_fingerprint;
+    node.ClientFingerprint = client_fingerprint.empty() ? fingerprint : client_fingerprint;
     node.XTLS = to_int(xtls);
     node.PublicKey = public_key;
     node.ShortID = short_id;
@@ -2185,6 +2185,8 @@ void explodeStdVLESS(std::string vless, Proxy &node) {
         net = getUrlArg(addition,"type");
         alpn = getUrlArg(addition, "alpn");
         fingerprint = getUrlArg(addition, "hpkp");
+        if (fingerprint.empty())
+            fingerprint = getUrlArg(addition, "fp");
         flow = getUrlArg(addition, "flow");
         xtls = getUrlArg(addition, "xtls");
         public_key = getUrlArg(addition, "pbk");
