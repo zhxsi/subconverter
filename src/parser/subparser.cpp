@@ -1366,8 +1366,12 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes)
                 singleproxy["reality-opts"]["public-key"] >>= public_key;
                 singleproxy["reality-opts"]["short-id"] >>= short_id;
                 singleproxy["reality-opts"]["spider-x"] >>= spider_x;
+                if (singleproxy["reality-opts"]["support-x25519mlkem768"].IsDefined())
+                    singleproxy["reality-opts"]["support-x25519mlkem768"] >>= support_x25519mlkem768;
             }
-            singleproxy["support-x25519mlkem768"] >>= support_x25519mlkem768;
+            // Backward compatibility with incorrectly generated top-level values.
+            if (support_x25519mlkem768.empty())
+                singleproxy["support-x25519mlkem768"] >>= support_x25519mlkem768;
             switch (hash_(net))
             {
                 case "ws"_hash:
@@ -2209,10 +2213,16 @@ void explodeStdVLESS(std::string vless, Proxy &node) {
         switch(hash_(net))
         {
             case "tcp"_hash:
+                type = getUrlArg(addition, "headerType");
+                // REALITY SNI is not a TCP Host header.
+                if (type != "none")
+                    host = getUrlArg(addition, "host");
+                path = getUrlArg(addition, "path");
+                break;
             case "ws"_hash:
             case "h2"_hash:
                 type = getUrlArg(addition, "headerType");
-                host = getUrlArg(addition, strFind(addition,"sni") ? "sni" : "host");
+                host = getUrlArg(addition, "host");
                 path = getUrlArg(addition, "path");
                 break;
             case "grpc"_hash:
