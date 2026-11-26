@@ -639,7 +639,8 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
             switch(hash_(x.TransferProtocol))
             {
                 case "tcp"_hash:
-                    if(!x.Host.empty())
+                    // RAW/TCP REALITY does not use an HTTP Host header.
+                    if (x.PublicKey.empty() && !x.Host.empty())
                         singleproxy["host"] = x.Host;
                     if(!x.Path.empty())
                         singleproxy["path"] = x.Path;
@@ -691,10 +692,14 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
                     break;
             }
 
-            if (!x.ClientFingerprint.empty())
-                singleproxy["fingerprint"] = x.ClientFingerprint;
-            else if (!x.Fingerprint.empty())
-                singleproxy["fingerprint"] = x.Fingerprint;
+            // REALITY uses client-fingerprint; a top-level fingerprint would be
+            // interpreted as a certificate fingerprint, not a uTLS identifier.
+            if (x.PublicKey.empty()) {
+                if (!x.ClientFingerprint.empty())
+                    singleproxy["fingerprint"] = x.ClientFingerprint;
+                else if (!x.Fingerprint.empty())
+                    singleproxy["fingerprint"] = x.Fingerprint;
+            }
             if (x.XTLS == 2) {
                 singleproxy["flow"] = "xtls-rprx-vision";
             } else if (!x.FlowSet.is_undef() && x.FlowSet.get()) {
@@ -710,7 +715,7 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
                 if (!x.SpiderX.empty())
                     singleproxy["reality-opts"]["spider-x"] = x.SpiderX;
                 if (!x.SupportX25519MLKEM768.is_undef())
-                    singleproxy["support-x25519mlkem768"] = x.SupportX25519MLKEM768.get();
+                    singleproxy["reality-opts"]["support-x25519mlkem768"] = x.SupportX25519MLKEM768.get();
                 if (!x.ClientFingerprint.empty()) {
                     singleproxy["client-fingerprint"] = x.ClientFingerprint;
                 } else if (!x.Fingerprint.empty()) {
