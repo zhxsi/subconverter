@@ -691,7 +691,9 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
                     break;
             }
 
-            if (!x.Fingerprint.empty())
+            if (!x.ClientFingerprint.empty())
+                singleproxy["fingerprint"] = x.ClientFingerprint;
+            else if (!x.Fingerprint.empty())
                 singleproxy["fingerprint"] = x.Fingerprint;
             if (x.XTLS == 2) {
                 singleproxy["flow"] = "xtls-rprx-vision";
@@ -705,6 +707,10 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
             if (!x.PublicKey.empty()) {
                 singleproxy["reality-opts"]["public-key"] = x.PublicKey;
                 singleproxy["reality-opts"]["short-id"] = x.ShortID;
+                if (!x.SpiderX.empty())
+                    singleproxy["reality-opts"]["spider-x"] = x.SpiderX;
+                if (!x.SupportX25519MLKEM768.is_undef())
+                    singleproxy["support-x25519mlkem768"] = x.SupportX25519MLKEM768.get();
                 if (!x.ClientFingerprint.empty()) {
                     singleproxy["client-fingerprint"] = x.ClientFingerprint;
                 } else if (!x.Fingerprint.empty()) {

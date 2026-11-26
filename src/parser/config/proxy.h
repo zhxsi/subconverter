@@ -177,6 +177,8 @@ struct Proxy
     tribool AuthenticatedLength;
     tribool XUDP;
     String ShortID;
+    String SpiderX;                         // Reality spider-x path
+    tribool SupportX25519MLKEM768;
 
     // New parameters from mihomo
     String IpVersion;                    // ip-version: ipv4/ipv6/dual/ipv4-prefer/ipv6-prefer

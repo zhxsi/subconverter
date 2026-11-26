@@ -1246,7 +1246,7 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes)
         std::string obfs_password, cwnd; //hysteria2
         std::string uuid, heartbeat_interval, disable_sni, reduce_rtt, request_timeout, udp_relay_mode, congestion_controller, max_udp_relay_packet_size, max_open_streams, fast_open;   //TUIC
         std::string idle_session_check_interval, idle_session_timeout, min_idle_session;
-        std::string flow, xtls, short_id;
+        std::string flow, xtls, short_id, spider_x, support_x25519mlkem768;
         // New parameters from mihomo
         std::string ip_version, client_fingerprint, ech_config, certificate, private_key_pem, vless_encryption;
         std::string smux_protocol, ws_early_data_header_name, http_method, trojan_ss_method, trojan_ss_password;
@@ -1365,7 +1365,9 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes)
             if (singleproxy["reality-opts"].IsDefined()) {
                 singleproxy["reality-opts"]["public-key"] >>= public_key;
                 singleproxy["reality-opts"]["short-id"] >>= short_id;
+                singleproxy["reality-opts"]["spider-x"] >>= spider_x;
             }
+            singleproxy["support-x25519mlkem768"] >>= support_x25519mlkem768;
             switch (hash_(net))
             {
                 case "ws"_hash:
@@ -1418,6 +1420,9 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes)
             node.PrivateKeyPem = private_key_pem;
             singleproxy["encryption"] >>= vless_encryption;
             node.VlessEncryption = vless_encryption;
+            node.SpiderX = spider_x;
+            if (!support_x25519mlkem768.empty())
+                node.SupportX25519MLKEM768 = tribool(support_x25519mlkem768);
             // packet-encoding and xudp support - only assign if explicitly provided
             if(singleproxy["packet-encoding"].IsDefined())
             {
@@ -2130,6 +2135,7 @@ void explodeStdVLESS(std::string vless, Proxy &node) {
     std::string add, port, uuid, sni, alpn, net, type, mode, host, path, fingerprint, remarks, addition, flow, xtls, public_key, short_id, security, tls;
     tribool tfo, scv;
     std::string decoded, userinfo, hostinfo;
+    std::string spider_x, support_x25519mlkem768;
     string_array user_parts;
 
     vless = vless.substr(8);
@@ -2192,6 +2198,8 @@ void explodeStdVLESS(std::string vless, Proxy &node) {
         public_key = getUrlArg(addition, "pbk");
         security = getUrlArg(addition, "security");
         short_id = getUrlArg(addition, "sid");
+        spider_x = getUrlArg(addition, "spx");
+        support_x25519mlkem768 = getUrlArg(addition, "support-x25519mlkem768");
         tfo = tribool(getUrlArg(addition, "tfo"));
         std::string insecure_val = getUrlArg(addition, "insecure");
         if (insecure_val.empty())
@@ -2232,6 +2240,9 @@ void explodeStdVLESS(std::string vless, Proxy &node) {
         remarks = add + ":" + port;
     node.TLSSecure = security == "tls" || security == "reality";
     vlessConstruct(node, VLESS_DEFAULT_GROUP, remarks, add, port, uuid, sni, alpn, type, net, mode, host, path, fingerprint, flow, xtls, public_key, short_id, "", tribool(), tfo, scv, "");
+    node.SpiderX = spider_x;
+    if (!support_x25519mlkem768.empty())
+        node.SupportX25519MLKEM768 = tribool(support_x25519mlkem768);
 }
 
 void explodeVLESS(std::string vless, Proxy &node) {
