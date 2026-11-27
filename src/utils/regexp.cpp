@@ -1,5 +1,7 @@
 #include <string>
 #include <cstdarg>
+#include <list>
+#include <unordered_map>
 
 /*
 #ifdef USE_STD_REGEX
@@ -11,6 +13,83 @@ using jp = jpcre2::select<char>;
 //#endif // USE_STD_REGEX
 
 #include "regexp.h"
+
+namespace
+{
+enum class RegexCacheMode : char
+{
+    Match = 'M',
+    Find = 'F',
+    ReplaceMulti = 'R',
+    ReplaceSingle = 'S',
+    Valid = 'V'
+};
+
+struct ThreadLocalRegexCache
+{
+    static constexpr size_t kMaxEntries = 256;
+
+    struct Entry
+    {
+        std::string key;
+        jp::Regex regex;
+    };
+
+    std::list<Entry> lru;
+    std::unordered_map<std::string, std::list<Entry>::iterator> index;
+
+    jp::Regex &get(RegexCacheMode mode, const std::string &pattern)
+    {
+        std::string key;
+        key.reserve(pattern.size() + 2);
+        key.push_back(static_cast<char>(mode));
+        key.push_back('\0');
+        key.append(pattern);
+
+        auto it = index.find(key);
+        if(it != index.end())
+        {
+            lru.splice(lru.begin(), lru, it->second);
+            return it->second->regex;
+        }
+
+        jp::Regex compiled;
+        switch(mode)
+        {
+        case RegexCacheMode::Match:
+            compiled.setPattern(pattern).addModifier("m").addPcre2Option(PCRE2_ANCHORED | PCRE2_ENDANCHORED | PCRE2_UTF).compile();
+            break;
+        case RegexCacheMode::Find:
+            compiled.setPattern(pattern).addModifier("m").addPcre2Option(PCRE2_UTF | PCRE2_ALT_BSUX).compile();
+            break;
+        case RegexCacheMode::ReplaceMulti:
+            compiled.setPattern(pattern).addModifier("m").addPcre2Option(PCRE2_UTF | PCRE2_MULTILINE | PCRE2_ALT_BSUX).compile();
+            break;
+        case RegexCacheMode::ReplaceSingle:
+            compiled.setPattern(pattern).addPcre2Option(PCRE2_UTF | PCRE2_MULTILINE | PCRE2_ALT_BSUX).compile();
+            break;
+        case RegexCacheMode::Valid:
+            compiled.setPattern(pattern).addPcre2Option(PCRE2_UTF | PCRE2_ALT_BSUX).compile();
+            break;
+        }
+
+        lru.emplace_front(Entry{key, std::move(compiled)});
+        index[key] = lru.begin();
+        if(lru.size() > kMaxEntries)
+        {
+            index.erase(lru.back().key);
+            lru.pop_back();
+        }
+        return lru.front().regex;
+    }
+};
+
+jp::Regex &getCachedRegex(RegexCacheMode mode, const std::string &pattern)
+{
+    thread_local ThreadLocalRegexCache cache;
+    return cache.get(mode, pattern);
+}
+} // namespace
 
 /*
 #ifdef USE_STD_REGEX
@@ -133,8 +212,7 @@ int regGetMatch(const std::string &src, const std::string &match, size_t group_c
 */
 bool regMatch(const std::string &src, const std::string &match)
 {
-    jp::Regex reg;
-    reg.setPattern(match).addModifier("m").addPcre2Option(PCRE2_ANCHORED|PCRE2_ENDANCHORED|PCRE2_UTF).compile();
+    jp::Regex &reg = getCachedRegex(RegexCacheMode::Match, match);
     if(!reg)
         return false;
     return reg.match(src, "g");
@@ -142,8 +220,7 @@ bool regMatch(const std::string &src, const std::string &match)
 
 bool regFind(const std::string &src, const std::string &match)
 {
-    jp::Regex reg;
-    reg.setPattern(match).addModifier("m").addPcre2Option(PCRE2_UTF|PCRE2_ALT_BSUX).compile();
+    jp::Regex &reg = getCachedRegex(RegexCacheMode::Find, match);
     if(!reg)
         return false;
     return reg.match(src, "g");
@@ -151,8 +228,7 @@ bool regFind(const std::string &src, const std::string &match)
 
 std::string regReplace(const std::string &src, const std::string &match, const std::string &rep, bool global, bool multiline)
 {
-    jp::Regex reg;
-    reg.setPattern(match).addModifier(multiline ? "m" : "").addPcre2Option(PCRE2_UTF|PCRE2_MULTILINE|PCRE2_ALT_BSUX).compile();
+    jp::Regex &reg = getCachedRegex(multiline ? RegexCacheMode::ReplaceMulti : RegexCacheMode::ReplaceSingle, match);
     if(!reg)
         return src;
     return reg.replace(src, rep, global ? "gEx" : "Ex");
@@ -160,9 +236,7 @@ std::string regReplace(const std::string &src, const std::string &match, const s
 
 bool regValid(const std::string &reg)
 {
-    jp::Regex r;
-    r.setPattern(reg).addPcre2Option(PCRE2_UTF|PCRE2_ALT_BSUX).compile();
-    return !!r;
+    return !!getCachedRegex(RegexCacheMode::Valid, reg);
 }
 
 int regGetMatch(const std::string &src, const std::string &match, size_t group_count, ...)
@@ -189,8 +263,9 @@ int regGetMatch(const std::string &src, const std::string &match, size_t group_c
 
 std::vector<std::string> regGetAllMatch(const std::string &src, const std::string &match, bool group_only)
 {
-    jp::Regex reg;
-    reg.setPattern(match).addModifier("m").addPcre2Option(PCRE2_UTF|PCRE2_ALT_BSUX).compile();
+    jp::Regex &reg = getCachedRegex(RegexCacheMode::Find, match);
+    if(!reg)
+        return {};
     jp::VecNum vec_num;
     jp::RegexMatch rm;
     size_t count = rm.setRegexObject(&reg).setSubject(src).setNumberedSubstringVector(&vec_num).setModifier("gm").match();

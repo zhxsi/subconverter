@@ -1,7 +1,10 @@
 #include <iostream>
+#include <cstdio>
 #include <unistd.h>
 #include <sys/stat.h>
-//#include <mutex>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <atomic>
 
@@ -40,12 +43,10 @@ struct curl_progress_data
 
 static inline void curl_init()
 {
-    static bool init = false;
-    if(!init)
-    {
+    static std::once_flag init_flag;
+    std::call_once(init_flag, []() {
         curl_global_init(CURL_GLOBAL_ALL);
-        init = true;
-    }
+    });
 }
 
 static int writer(char *data, size_t size, size_t nmemb, std::string *writerData)
@@ -131,7 +132,9 @@ static inline void curl_set_common_options(CURL *curl_handle, const char *url, c
     curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, 20L);
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 5L);
     curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(curl_handle, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(curl_handle, CURLOPT_COOKIEFILE, "");
     if(data)
     {
@@ -297,6 +300,67 @@ std::string buildSocks5ProxyString(const std::string &addr, int port, const std:
     return proxystr;
 }
 
+namespace
+{
+struct InFlightResult
+{
+    int return_code = 0;
+    std::string content;
+    std::string headers;
+};
+
+struct InFlightEntry
+{
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool done = false;
+    InFlightResult result;
+};
+
+std::mutex inflight_map_mutex;
+std::map<std::string, std::shared_ptr<InFlightEntry>> inflight_map;
+std::atomic<uint64_t> cache_tmp_seq{0};
+
+void atomicFileWrite(const std::string &path, const std::string &data)
+{
+    std::string tmp_path = path + ".tmp." + std::to_string(cache_tmp_seq.fetch_add(1, std::memory_order_relaxed));
+    if(fileWrite(tmp_path, data, true) != 0)
+    {
+        fileWrite(path, data, true);
+        return;
+    }
+#ifdef _WIN32
+    std::remove(path.c_str());
+#endif
+    if(std::rename(tmp_path.c_str(), path.c_str()) != 0)
+    {
+        std::remove(tmp_path.c_str());
+        fileWrite(path, data, true);
+    }
+}
+
+std::string buildSingleflightKey(const std::string &url, const std::string &proxy, const string_icase_map *request_headers)
+{
+    std::string key = url;
+    key.push_back('\n');
+    key += proxy;
+    if(request_headers)
+    {
+        if(auto it = request_headers->find("User-Agent"); it != request_headers->end())
+        {
+            key += "\nUA:";
+            key += it->second;
+        }
+        if(auto it = request_headers->find("Referer"); it != request_headers->end())
+        {
+            key += "\nRef:";
+            key += it->second;
+        }
+    }
+    return key;
+}
+} // namespace
+
 std::string webGet(const std::string &url, const std::string &proxy, unsigned int cache_ttl, std::string *response_headers, string_icase_map *request_headers)
 {
     int return_code = 0;
@@ -307,57 +371,136 @@ std::string webGet(const std::string &url, const std::string &proxy, unsigned in
 
     if (startsWith(url, "data:"))
         return dataGet(url);
-    // cache system
+    // cache system with cross-request singleflight coalescing & atomic cache writes
     if(cache_ttl > 0)
     {
         md("cache");
         const std::string url_md5 = getMD5(url);
         const std::string path = "cache/" + url_md5, path_header = path + "_header";
-        struct stat result {};
-        if(stat(path.data(), &result) == 0) // cache exist
+        auto try_read_valid_cache = [&](bool &exists, std::string &out_content, std::string &out_headers) -> bool
         {
-            time_t mtime = result.st_mtime, now = time(nullptr); // get cache modified time and current time
-            if(difftime(now, mtime) <= cache_ttl) // within TTL
+            cache_rw_lock.readLock();
+            defer(cache_rw_lock.readUnlock();)
+            struct stat result {};
+            if(stat(path.data(), &result) == 0)
             {
-                writeLog(0, "CACHE HIT: '" + url + "', using local cache.");
-                //guarded_mutex guard(cache_rw_lock);
-                cache_rw_lock.readLock();
-                defer(cache_rw_lock.readUnlock();)
-                if(response_headers)
-                    *response_headers = fileGet(path_header, true);
-                return fileGet(path, true);
+                exists = true;
+                time_t mtime = result.st_mtime, now = time(nullptr);
+                if(difftime(now, mtime) <= cache_ttl)
+                {
+                    out_content = fileGet(path, true);
+                    if(response_headers)
+                        out_headers = fileGet(path_header, true);
+                    return true;
+                }
             }
-            writeLog(0, "CACHE MISS: '" + url + "', TTL timeout, creating new cache."); // out of TTL
+            return false;
+        };
+
+        bool cache_exists = false;
+        std::string cached_content, cached_headers;
+        if(try_read_valid_cache(cache_exists, cached_content, cached_headers))
+        {
+            writeLog(0, "CACHE HIT: '" + url + "', using local cache.");
+            if(response_headers)
+                *response_headers = std::move(cached_headers);
+            return cached_content;
         }
+
+        // Cross-request singleflight: coalesce concurrent cache-miss fetches for the same URL.
+        const std::string sf_key = buildSingleflightKey(url, proxy, request_headers);
+        std::shared_ptr<InFlightEntry> entry;
+        bool is_leader = false;
+        {
+            std::lock_guard<std::mutex> lk(inflight_map_mutex);
+            auto it = inflight_map.find(sf_key);
+            if(it != inflight_map.end())
+            {
+                entry = it->second;
+            }
+            else
+            {
+                entry = std::make_shared<InFlightEntry>();
+                inflight_map.emplace(sf_key, entry);
+                is_leader = true;
+            }
+        }
+
+        if(!is_leader)
+        {
+            std::unique_lock<std::mutex> lk(entry->mtx);
+            entry->cv.wait(lk, [&]() { return entry->done; });
+            if(response_headers)
+                *response_headers = entry->result.headers;
+            return entry->result.content;
+        }
+
+        InFlightResult sf_res;
+        auto finish_singleflight = [&]()
+        {
+            {
+                std::lock_guard<std::mutex> lk(entry->mtx);
+                entry->result = sf_res;
+                entry->done = true;
+            }
+            {
+                std::lock_guard<std::mutex> lk(inflight_map_mutex);
+                auto it = inflight_map.find(sf_key);
+                if(it != inflight_map.end() && it->second == entry)
+                    inflight_map.erase(it);
+            }
+            entry->cv.notify_all();
+        };
+        defer(finish_singleflight());
+
+        // Re-check cache after becoming leader in case a previous leader just populated it.
+        if(try_read_valid_cache(cache_exists, cached_content, cached_headers))
+        {
+            writeLog(0, "CACHE HIT: '" + url + "', using local cache.");
+            sf_res.return_code = 200;
+            sf_res.content = cached_content;
+            sf_res.headers = cached_headers;
+            if(response_headers)
+                *response_headers = std::move(cached_headers);
+            return cached_content;
+        }
+
+        if(cache_exists)
+            writeLog(0, "CACHE MISS: '" + url + "', TTL timeout, creating new cache."); // out of TTL
         else
             writeLog(0, "CACHE NOT EXIST: '" + url + "', creating new cache.");
-        //content = curlGet(url, proxy, response_headers, return_code); // try to fetch data
-        curlGet(argument, fetch_res);
-        if(return_code == 200) // success, save new cache
+
+        FetchResult leader_res {&sf_res.return_code, &sf_res.content, &sf_res.headers, nullptr};
+        curlGet(argument, leader_res);
+        if(sf_res.return_code == 200) // success, save new cache atomically
         {
-            //guarded_mutex guard(cache_rw_lock);
             cache_rw_lock.writeLock();
             defer(cache_rw_lock.writeUnlock();)
-            fileWrite(path, content, true);
-            if(response_headers)
-                fileWrite(path_header, *response_headers, true);
+            atomicFileWrite(path, sf_res.content);
+            atomicFileWrite(path_header, sf_res.headers);
         }
         else
         {
-            if(fileExist(path) && global.serveCacheOnFetchFail) // failed, check if cache exist
+            bool served_cache = false;
+            if(global.serveCacheOnFetchFail)
             {
-                writeLog(0, "Fetch failed. Serving cached content."); // cache exist, serving cache
-                //guarded_mutex guard(cache_rw_lock);
                 cache_rw_lock.readLock();
                 defer(cache_rw_lock.readUnlock();)
-                content = fileGet(path, true);
-                if(response_headers)
-                    *response_headers = fileGet(path_header, true);
+                if(fileExist(path)) // failed, check if cache exist
+                {
+                    sf_res.content = fileGet(path, true);
+                    sf_res.headers = fileGet(path_header, true);
+                    served_cache = true;
+                }
             }
+            if(served_cache)
+                writeLog(0, "Fetch failed. Serving cached content."); // cache exist, serving cache
             else
                 writeLog(0, "Fetch failed. No local cache available."); // cache not exist or not allow to serve cache, serving nothing
         }
-        return content;
+        if(response_headers)
+            *response_headers = sf_res.headers;
+        return sf_res.content;
     }
     //return curlGet(url, proxy, response_headers, return_code);
     curlGet(argument, fetch_res);

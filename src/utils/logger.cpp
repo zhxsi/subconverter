@@ -19,7 +19,12 @@ std::string getTime(int type)
     gettimeofday(&tv, nullptr);
     snprintf(cMillis, 7, "%.6ld", (long)tv.tv_usec);
     lt = time(nullptr);
-    struct tm *local = localtime(&lt);
+    struct tm local_tm {};
+#ifdef _WIN32
+    localtime_s(&local_tm, &lt);
+#else
+    localtime_r(&lt, &local_tm);
+#endif
     switch(type)
     {
     case 1:
@@ -34,7 +39,7 @@ std::string getTime(int type)
         format = "%Y-%m-%d %H:%M:%S";
         break;
     }
-    strftime(tmpbuf, 32, format.data(), local);
+    strftime(tmpbuf, 32, format.data(), &local_tm);
     return {tmpbuf};
 }
 

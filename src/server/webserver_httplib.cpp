@@ -3,6 +3,7 @@
 #include <malloc.h>
 #endif // MALLOC_TRIM
 #define CPPHTTPLIB_REQUEST_URI_MAX_LENGTH 16384
+#define CPPHTTPLIB_LISTEN_BACKLOG 1024
 #include "httplib.h"
 
 #include "utils/base64/base64.h"
