@@ -2,6 +2,7 @@
 #include <iostream>
 #include <numeric>
 #include <set>
+#include <unordered_set>
 #include <cmath>
 #include <climits>
 
@@ -26,6 +27,8 @@
 
 static std::string quoteClashShortId(const std::string &content)
 {
+    if(content.find("short-id:") == std::string::npos)
+        return content;
     return regReplace(content, "(short-id:\\s*)([A-Za-z0-9_-]+)", "$1\\\"$2\\\"", true);
 }
 
@@ -192,11 +195,47 @@ bool applyMatcher(const std::string &rule, std::string &real_rule, const Proxy &
     return true;
 }
 
-void processRemark(std::string &remark, const string_array &remarks_list, bool proc_comma = true)
+struct RemarkRegistry
+{
+    string_array list;
+    std::unordered_set<std::string> set;
+
+    bool contains(const std::string &r) const { return set.count(r) > 0; }
+    bool empty() const { return list.empty(); }
+    void emplace_back(const std::string &r)
+    {
+        list.emplace_back(r);
+        set.emplace(r);
+    }
+};
+
+void processRemark(std::string &remark, const RemarkRegistry &remarks_list, bool proc_comma = true)
 {
     // Replace every '=' with '-' in the remark string to avoid parse errors from the clients.
     //     Surge is tested to yield an error when handling '=' in the remark string, 
     //     not sure if other clients have the same problem.
+    std::replace(remark.begin(), remark.end(), '=', '-');
+
+    if(proc_comma)
+    {
+        if(remark.find(',') != std::string::npos)
+        {
+            remark.insert(0, "\"");
+            remark.append("\"");
+        }
+    }
+    std::string tempRemark = remark;
+    int cnt = 2;
+    while(remarks_list.contains(tempRemark))
+    {
+        tempRemark = remark + " " + std::to_string(cnt);
+        cnt++;
+    }
+    remark = tempRemark;
+}
+
+void processRemark(std::string &remark, const string_array &remarks_list, bool proc_comma = true)
+{
     std::replace(remark.begin(), remark.end(), '=', '-');
 
     if(proc_comma)
@@ -217,7 +256,7 @@ void processRemark(std::string &remark, const string_array &remarks_list, bool p
     remark = tempRemark;
 }
 
-void groupGenerate(const std::string &rule, std::vector<Proxy> &nodelist, string_array &filtered_nodelist, bool add_direct, extra_settings &ext)
+static void groupGenerateWithSeen(const std::string &rule, std::vector<Proxy> &nodelist, string_array &filtered_nodelist, std::unordered_set<std::string> &seen, bool add_direct, extra_settings &ext)
 {
     std::string real_rule;
     if(startsWith(rule, "[]") && add_direct)
@@ -235,6 +274,9 @@ void groupGenerate(const std::string &rule, std::vector<Proxy> &nodelist, string
                 auto filter = (std::function<std::string(const std::vector<Proxy>&)>) ctx.eval("filter");
                 std::string result_list = filter(nodelist);
                 filtered_nodelist = split(regTrim(result_list), "\n");
+                seen.clear();
+                for(const std::string &item : filtered_nodelist)
+                    seen.emplace(item);
             }
             catch (qjs::exception)
             {
@@ -253,10 +295,17 @@ void groupGenerate(const std::string &rule, std::vector<Proxy> &nodelist, string
         string_array regexes = expandRegionSpecToRegexes(spec_list, ext.region_presets);
         for(const std::string &reg : regexes)
         {
+            if(seen.size() >= nodelist.size() && !nodelist.empty())
+                break;
             for(Proxy &x : nodelist)
             {
-                if(regFind(x.Remark, reg) && (tail_regex.empty() || regFind(x.Remark, tail_regex)) && std::find(filtered_nodelist.begin(), filtered_nodelist.end(), x.Remark) == filtered_nodelist.end())
+                if(seen.count(x.Remark))
+                    continue;
+                if(regFind(x.Remark, reg) && (tail_regex.empty() || regFind(x.Remark, tail_regex)))
+                {
+                    seen.emplace(x.Remark);
                     filtered_nodelist.emplace_back(x.Remark);
+                }
             }
         }
     }
@@ -264,10 +313,83 @@ void groupGenerate(const std::string &rule, std::vector<Proxy> &nodelist, string
     {
         for(Proxy &x : nodelist)
         {
-            if(applyMatcher(rule, real_rule, x, &ext.region_presets) && (real_rule.empty() || regFind(x.Remark, real_rule)) && std::find(filtered_nodelist.begin(), filtered_nodelist.end(), x.Remark) == filtered_nodelist.end())
+            if(seen.count(x.Remark))
+                continue;
+            if(applyMatcher(rule, real_rule, x, &ext.region_presets) && (real_rule.empty() || regFind(x.Remark, real_rule)))
+            {
+                seen.emplace(x.Remark);
                 filtered_nodelist.emplace_back(x.Remark);
+            }
         }
     }
+}
+
+void groupGenerate(const std::string &rule, std::vector<Proxy> &nodelist, string_array &filtered_nodelist, bool add_direct, extra_settings &ext)
+{
+    std::unordered_set<std::string> seen;
+    seen.reserve(filtered_nodelist.size() + nodelist.size());
+    for(const std::string &existing : filtered_nodelist)
+        seen.emplace(existing);
+    groupGenerateWithSeen(rule, nodelist, filtered_nodelist, seen, add_direct, ext);
+}
+
+static void populateGroupProxies(const ProxyGroupConfig &x, std::vector<Proxy> &nodelist, string_array &filtered_nodelist, bool add_direct, extra_settings &ext)
+{
+    std::unordered_set<std::string> seen;
+    seen.reserve(nodelist.size());
+    for(const auto &y : x.Proxies)
+        groupGenerateWithSeen(y, nodelist, filtered_nodelist, seen, add_direct, ext);
+}
+
+static bool ruleMatchesAnyNode(const std::string &rule, std::vector<Proxy> &nodelist, extra_settings &ext)
+{
+    if(nodelist.empty())
+        return false;
+#ifndef NO_JS_RUNTIME
+    if(startsWith(rule, "script:") && ext.authorized)
+    {
+        string_array tmp;
+        std::unordered_set<std::string> seen;
+        groupGenerateWithSeen(rule, nodelist, tmp, seen, false, ext);
+        return std::any_of(tmp.begin(), tmp.end(), [](const std::string &s) { return !trim(s).empty(); });
+    }
+#endif // NO_JS_RUNTIME
+    if(startsWith(rule, "!!REGION="))
+    {
+        std::string body = rule.substr(9);
+        std::string::size_type sep = body.find("!!");
+        std::string spec_list = sep == std::string::npos ? body : body.substr(0, sep);
+        std::string tail_regex = sep == std::string::npos ? "" : body.substr(sep + 2);
+        string_array regexes = expandRegionSpecToRegexes(spec_list, ext.region_presets);
+        for(const std::string &reg : regexes)
+        {
+            for(Proxy &x : nodelist)
+            {
+                if(regFind(x.Remark, reg) && (tail_regex.empty() || regFind(x.Remark, tail_regex)))
+                    return true;
+            }
+        }
+        return false;
+    }
+    std::string real_rule;
+    for(Proxy &x : nodelist)
+    {
+        if(applyMatcher(rule, real_rule, x, &ext.region_presets) && (real_rule.empty() || regFind(x.Remark, real_rule)))
+            return true;
+    }
+    return false;
+}
+
+static std::string extractSingleRegionKey(const ProxyGroupConfig &g)
+{
+    if(g.Proxies.size() != 1 || !startsWith(g.Proxies[0], "!!REGION="))
+        return "";
+    std::string body = g.Proxies[0].substr(9);
+    if(body.find("!!") != std::string::npos || body.find(',') != std::string::npos
+       || body.find('!') != std::string::npos || body.find('+') != std::string::npos
+       || body.find('(') != std::string::npos)
+        return "";
+    return normalizeRegionName(body);
 }
 
 static bool isBuiltinPolicyName(const std::string &name)
@@ -278,7 +400,7 @@ static bool isBuiltinPolicyName(const std::string &name)
         || upper == "GLOBAL";
 }
 
-static ProxyGroupConfigs pruneEmptyProxyGroups(std::vector<Proxy> &nodelist, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext, std::set<std::string> *pruned_names = nullptr)
+static ProxyGroupConfigs pruneEmptyProxyGroups(std::vector<Proxy> &nodelist, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext, std::set<std::string> *pruned_names = nullptr, const std::vector<RulesetContent> *rulesets = nullptr)
 {
     if(!ext.prune_empty_groups || extra_proxy_group.empty())
         return extra_proxy_group;
@@ -311,7 +433,6 @@ static ProxyGroupConfigs pruneEmptyProxyGroups(std::vector<Proxy> &nodelist, con
             continue;
         }
 
-        string_array matched_nodes;
         for(const std::string &rule : g.Proxies)
         {
             if(startsWith(rule, "[]"))
@@ -325,11 +446,10 @@ static ProxyGroupConfigs pruneEmptyProxyGroups(std::vector<Proxy> &nodelist, con
             else
             {
                 m.has_node_matcher = true;
-                if(matched_nodes.empty())
-                    groupGenerate(rule, nodelist, matched_nodes, false, ext);
+                if(!m.has_matched_node)
+                    m.has_matched_node = ruleMatchesAnyNode(rule, nodelist, ext);
             }
         }
-        m.has_matched_node = std::any_of(matched_nodes.begin(), matched_nodes.end(), [](const std::string &s) { return !trim(s).empty(); });
 
         if(m.has_node_matcher)
         {
@@ -339,6 +459,62 @@ static ProxyGroupConfigs pruneEmptyProxyGroups(std::vector<Proxy> &nodelist, con
         else if(m.has_external_ref || !m.child_refs.empty())
         {
             alive.emplace(g.Name);
+        }
+    }
+
+    // Fold redundant broad continent/sub-region groups whose matched node set is
+    // identical to a single surviving child country group (unless targeted by rulesets).
+    std::set<std::string> protected_groups;
+    if(rulesets)
+    {
+        for(const RulesetContent &rc : *rulesets)
+            protected_groups.emplace(rc.rule_group);
+    }
+    std::vector<std::pair<size_t, std::string>> broad_groups, narrow_groups;
+    for(size_t i = 0; i < extra_proxy_group.size(); ++i)
+    {
+        const ProxyGroupConfig &g = extra_proxy_group[i];
+        if(!alive.count(g.Name))
+            continue;
+        std::string key = extractSingleRegionKey(g);
+        if(key.empty())
+            continue;
+        if(isBroadRegionMacro(key))
+        {
+            if(!protected_groups.count(g.Name))
+                broad_groups.emplace_back(i, std::move(key));
+        }
+        else if(key != "OTHER" && key != "ALL" && getRegionMacroChildren(key, ext.region_presets).empty())
+        {
+            narrow_groups.emplace_back(i, std::move(key));
+        }
+    }
+    if(!broad_groups.empty() && !narrow_groups.empty())
+    {
+        auto compute_sorted_nodes = [&](size_t idx) -> string_array
+        {
+            string_array matched;
+            populateGroupProxies(extra_proxy_group[idx], nodelist, matched, false, ext);
+            std::sort(matched.begin(), matched.end());
+            return matched;
+        };
+        std::map<size_t, string_array> narrow_nodes;
+        for(const auto &np : narrow_groups)
+            narrow_nodes.emplace(np.first, compute_sorted_nodes(np.first));
+
+        for(const auto &bp : broad_groups)
+        {
+            string_array broad_matched = compute_sorted_nodes(bp.first);
+            if(broad_matched.empty())
+                continue;
+            for(const auto &np : narrow_groups)
+            {
+                if(isRegionMacroChildOf(np.second, bp.second, ext.region_presets) && narrow_nodes[np.first] == broad_matched)
+                {
+                    alive.erase(extra_proxy_group[bp.first].Name);
+                    break;
+                }
+            }
         }
     }
 
@@ -425,11 +601,11 @@ static std::vector<RulesetContent> filterPrunedRulesets(const std::vector<Rulese
     return result;
 }
 
-static void proxyToClashImpl(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGroupConfigs &extra_proxy_group, bool clashR, extra_settings &ext, std::set<std::string> *pruned_groups = nullptr)
+static void proxyToClashImpl(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGroupConfigs &extra_proxy_group, bool clashR, extra_settings &ext, std::set<std::string> *pruned_groups = nullptr, const std::vector<RulesetContent> *rulesets = nullptr)
 {
     YAML::Node proxies, original_groups;
     std::vector<Proxy> nodelist;
-    string_array remarks_list;
+    RemarkRegistry remarks_list;
     /// proxies style
     bool proxy_block = false, proxy_compact = false, group_block = false, group_compact = false;
     switch(hash_(ext.clash_proxies_style))
@@ -977,7 +1153,7 @@ static void proxyToClashImpl(std::vector<Proxy> &nodes, YAML::Node &yamlnode, co
         yamlnode["Proxy"] = proxies;
 
 
-    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, pruned_groups);
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, pruned_groups, rulesets);
     if(pruned_groups && !pruned_groups->empty() && original_groups.IsSequence())
     {
         YAML::Node kept_original_groups;
@@ -1030,8 +1206,7 @@ static void proxyToClashImpl(std::vector<Proxy> &nodes, YAML::Node &yamlnode, co
         if(!x.DisableUdp.is_undef())
             singlegroup["disable-udp"] = x.DisableUdp.get();
 
-        for(const auto& y : x.Proxies)
-            groupGenerate(y, nodelist, filtered_nodelist, true, ext);
+        populateGroupProxies(x, nodelist, filtered_nodelist, true, ext);
 
         if(!x.UsingProvider.empty())
             singlegroup["use"] = x.UsingProvider;
@@ -1090,7 +1265,7 @@ std::string proxyToClash(std::vector<Proxy> &nodes, const std::string &base_conf
     }
 
     std::set<std::string> pruned_groups;
-    proxyToClashImpl(nodes, yamlnode, extra_proxy_group, clashR, ext, &pruned_groups);
+    proxyToClashImpl(nodes, yamlnode, extra_proxy_group, clashR, ext, &pruned_groups, &ruleset_content_array);
 
     if(ext.nodelist)
         return quoteClashShortId(YAML::Dump(yamlnode));
@@ -1156,7 +1331,7 @@ std::string proxyToSurge(std::vector<Proxy> &nodes, const std::string &base_conf
     std::string output_nodelist;
     std::vector<Proxy> nodelist;
     unsigned short local_port = 1080;
-    string_array remarks_list;
+    RemarkRegistry remarks_list;
 
     ini.store_any_line = true;
     // filter out sections that requires direct-save
@@ -1400,7 +1575,7 @@ std::string proxyToSurge(std::vector<Proxy> &nodes, const std::string &base_conf
     ini.get_items(original_groups);
     ini.erase_section();
     std::set<std::string> pruned_groups;
-    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups);
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups, &ruleset_content_array);
     for(const ProxyGroupConfig &x : active_proxy_group)
     {
         string_array filtered_nodelist;
@@ -1426,8 +1601,7 @@ std::string proxyToSurge(std::vector<Proxy> &nodes, const std::string &base_conf
             continue;
         }
 
-        for(const auto &y : x.Proxies)
-            groupGenerate(y, nodelist, filtered_nodelist, true, ext);
+        populateGroupProxies(x, nodelist, filtered_nodelist, true, ext);
 
         if(filtered_nodelist.empty())
             filtered_nodelist.emplace_back("DIRECT");
@@ -1646,7 +1820,7 @@ void proxyToQuan(std::vector<Proxy> &nodes, INIReader &ini, std::vector<RulesetC
 {
     std::string proxyStr;
     std::vector<Proxy> nodelist;
-    string_array remarks_list;
+    RemarkRegistry remarks_list;
 
     ini.set_current_section("SERVER");
     ini.erase_section();
@@ -1781,7 +1955,7 @@ void proxyToQuan(std::vector<Proxy> &nodes, INIReader &ini, std::vector<RulesetC
     ini.erase_section();
 
     std::set<std::string> pruned_groups;
-    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups);
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups, &ruleset_content_array);
     for(const ProxyGroupConfig &x : active_proxy_group)
     {
         string_array filtered_nodelist;
@@ -1824,8 +1998,7 @@ void proxyToQuan(std::vector<Proxy> &nodes, INIReader &ini, std::vector<RulesetC
             continue;
         }
 
-        for(const auto &y : x.Proxies)
-            groupGenerate(y, nodelist, filtered_nodelist, true, ext);
+        populateGroupProxies(x, nodelist, filtered_nodelist, true, ext);
 
         if(filtered_nodelist.empty())
             filtered_nodelist.emplace_back("direct");
@@ -1885,7 +2058,7 @@ void proxyToQuanX(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Ruleset
     std::string proxyStr;
     tribool udp, tfo, scv, tls13;
     std::vector<Proxy> nodelist;
-    string_array remarks_list;
+    RemarkRegistry remarks_list;
 
     ini.set_current_section("server_local");
     ini.erase_section();
@@ -2113,7 +2286,7 @@ void proxyToQuanX(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Ruleset
     ini.erase_section();
 
     std::set<std::string> pruned_groups;
-    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups);
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups, &ruleset_content_array);
     for(const ProxyGroupConfig &x : active_proxy_group)
     {
         std::string type;
@@ -2144,8 +2317,7 @@ void proxyToQuanX(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Ruleset
 
         if(x.Type != ProxyGroupType::SSID)
         {
-            for(const auto &y : x.Proxies)
-                groupGenerate(y, nodelist, filtered_nodelist, true, ext);
+            populateGroupProxies(x, nodelist, filtered_nodelist, true, ext);
 
             if(filtered_nodelist.empty())
                 filtered_nodelist.emplace_back("direct");
@@ -2320,7 +2492,8 @@ void proxyToMellow(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Rulese
     std::string url;
     tribool tfo, scv;
     std::vector<Proxy> nodelist;
-    string_array vArray, remarks_list;
+    string_array vArray;
+    RemarkRegistry remarks_list;
 
     ini.set_current_section("Endpoint");
 
@@ -2399,7 +2572,7 @@ void proxyToMellow(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Rulese
     ini.set_current_section("EndpointGroup");
 
     std::set<std::string> pruned_groups;
-    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups);
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups, &ruleset_content_array);
     for(const ProxyGroupConfig &x : active_proxy_group)
     {
         string_array filtered_nodelist;
@@ -2417,15 +2590,14 @@ void proxyToMellow(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Rulese
             continue;
         }
 
-        for(const auto &y : x.Proxies)
-            groupGenerate(y, nodelist, filtered_nodelist, false, ext);
+        populateGroupProxies(x, nodelist, filtered_nodelist, false, ext);
 
         if(filtered_nodelist.empty())
         {
             if(remarks_list.empty())
                 filtered_nodelist.emplace_back("DIRECT");
             else
-                filtered_nodelist = remarks_list;
+                filtered_nodelist = remarks_list.list;
         }
 
         //don't process these for now
@@ -2462,7 +2634,7 @@ std::string proxyToLoon(std::vector<Proxy> &nodes, const std::string &base_conf,
     std::string output_nodelist;
     std::vector<Proxy> nodelist;
 
-    string_array remarks_list;
+    RemarkRegistry remarks_list;
 
     ini.store_any_line = true;
     ini.add_direct_save_section("Plugin");
@@ -2616,7 +2788,7 @@ std::string proxyToLoon(std::vector<Proxy> &nodes, const std::string &base_conf,
     ini.erase_section();
 
     std::set<std::string> pruned_groups;
-    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups);
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups, &ruleset_content_array);
     for(const ProxyGroupConfig &x : active_proxy_group)
     {
         string_array filtered_nodelist;
@@ -2640,8 +2812,7 @@ std::string proxyToLoon(std::vector<Proxy> &nodes, const std::string &base_conf,
             continue;
         }
 
-        for(const auto &y : x.Proxies)
-            groupGenerate(y, nodelist, filtered_nodelist, true, ext);
+        populateGroupProxies(x, nodelist, filtered_nodelist, true, ext);
 
         if(filtered_nodelist.empty())
             filtered_nodelist.emplace_back("DIRECT");
@@ -2777,7 +2948,7 @@ static void proxyToSingBoxImpl(std::vector<Proxy> &nodes, rapidjson::Document &j
     rapidjson::Document::AllocatorType &allocator = json.GetAllocator();
     rapidjson::Value outbounds(rapidjson::kArrayType), route(rapidjson::kArrayType);
     std::vector<Proxy> nodelist;
-    string_array remarks_list;
+    RemarkRegistry remarks_list;
 
     if (!ext.nodelist)
     {
@@ -3165,7 +3336,7 @@ static void proxyToSingBoxImpl(std::vector<Proxy> &nodes, rapidjson::Document &j
         return;
     }
 
-    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, pruned_groups);
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, pruned_groups, &ruleset_content_array);
     for (const ProxyGroupConfig &x: active_proxy_group)
     {
         string_array filtered_nodelist;
@@ -3187,8 +3358,7 @@ static void proxyToSingBoxImpl(std::vector<Proxy> &nodes, rapidjson::Document &j
             default:
                 continue;
         }
-        for (const auto &y : x.Proxies)
-            groupGenerate(y, nodelist, filtered_nodelist, true, ext);
+        populateGroupProxies(x, nodelist, filtered_nodelist, true, ext);
 
         if (filtered_nodelist.empty())
             filtered_nodelist.emplace_back("DIRECT");
@@ -3222,7 +3392,7 @@ static void proxyToSingBoxImpl(std::vector<Proxy> &nodes, rapidjson::Document &j
         global_group.AddMember("tag", "GLOBAL", allocator);
         global_group.AddMember("outbounds", rapidjson::Value(rapidjson::kArrayType), allocator);
         global_group["outbounds"].PushBack("DIRECT", allocator);
-        for (auto &x: remarks_list)
+        for (auto &x: remarks_list.list)
         {
             global_group["outbounds"].PushBack(rapidjson::Value(x.c_str(), allocator), allocator);
         }

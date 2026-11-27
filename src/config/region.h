@@ -379,6 +379,25 @@ inline string_array expandRegionMacroKeys(const std::string &key, const RegionPr
     return out;
 }
 
+inline bool isBroadRegionMacro(const std::string &key)
+{
+    static const std::set<std::string> broad = {
+        "ASIA", "EUROPE", "AMERICA", "OCEANIA", "AFRICA",
+        "EAST_ASIA", "SOUTHEAST_ASIA", "SOUTH_ASIA", "MIDDLE_EAST",
+        "WESTERN_EUROPE", "NORTHERN_EUROPE", "SOUTHERN_EUROPE", "EASTERN_EUROPE",
+        "NORTH_AMERICA", "SOUTH_AMERICA"
+    };
+    return broad.count(key) > 0;
+}
+
+inline bool isRegionMacroChildOf(const std::string &child_key, const std::string &parent_key, const RegionPresetMap &presets)
+{
+    if(child_key == parent_key || !isBroadRegionMacro(parent_key))
+        return false;
+    string_array expanded = expandRegionMacroKeys(parent_key, presets, false);
+    return std::find(expanded.begin(), expanded.end(), child_key) != expanded.end();
+}
+
 inline std::string buildOtherRegex(const string_array &excluded_keys, const RegionPresetMap &presets, const std::string &inline_extra)
 {
     std::string combined;

@@ -49,6 +49,35 @@ static inline void curl_init()
     });
 }
 
+namespace
+{
+struct ThreadLocalCurlHandle
+{
+    CURL *handle = nullptr;
+
+    CURL *acquire()
+    {
+        if(!handle)
+            handle = curl_easy_init();
+        else
+            curl_easy_reset(handle);
+        return handle;
+    }
+
+    ~ThreadLocalCurlHandle()
+    {
+        if(handle)
+            curl_easy_cleanup(handle);
+    }
+};
+
+CURL *getThreadLocalCurlHandle()
+{
+    thread_local ThreadLocalCurlHandle tl_curl;
+    return tl_curl.acquire();
+}
+} // namespace
+
 static int writer(char *data, size_t size, size_t nmemb, std::string *writerData)
 {
     if(writerData == nullptr)
@@ -156,7 +185,12 @@ static int curlGet(const FetchArgument &argument, FetchResult &result)
 
     curl_init();
 
-    curl_handle = curl_easy_init();
+    curl_handle = getThreadLocalCurlHandle();
+    if(!curl_handle)
+        return 0;
+    // Clear any cookies from prior requests on this pooled handle while keeping
+    // libcurl's persistent TCP/TLS connection pool and DNS cache intact.
+    curl_easy_setopt(curl_handle, CURLOPT_COOKIELIST, "ALL");
     if(!argument.proxy.empty())
     {
         if(startsWith(argument.proxy, "cors:"))
@@ -170,7 +204,9 @@ static int curlGet(const FetchArgument &argument, FetchResult &result)
     curl_progress_data limit;
     limit.size_limit = global.maxAllowedDownloadSize;
     curl_set_common_options(curl_handle, new_url.data(), &limit);
-    header_list = curl_slist_append(header_list, "Content-Type: application/json;charset=utf-8");
+    bool has_content_type = argument.request_headers && argument.request_headers->contains("Content-Type");
+    if((argument.method == HTTP_POST || argument.method == HTTP_PATCH) && !has_content_type)
+        header_list = curl_slist_append(header_list, "Content-Type: application/json;charset=utf-8");
     if(argument.request_headers)
     {
         for(auto &x : *argument.request_headers)
@@ -239,8 +275,11 @@ static int curlGet(const FetchArgument &argument, FetchResult &result)
         retVal = curl_easy_perform(curl_handle);
         if(retVal == CURLE_OK || max_fails <= fail_count || global.APIMode)
             break;
-        else
-            fail_count++;
+        if(result.content)
+            result.content->clear();
+        if(result.response_headers)
+            result.response_headers->clear();
+        fail_count++;
     }
 
     long code = 0;
@@ -264,7 +303,9 @@ static int curlGet(const FetchArgument &argument, FetchResult &result)
         curl_slist_free_all(cookies);
     }
 
-    curl_easy_cleanup(curl_handle);
+    // Keep pooled curl_handle alive for connection/TLS reuse; clear cookies & per-call pointers.
+    curl_easy_setopt(curl_handle, CURLOPT_COOKIELIST, "ALL");
+    curl_easy_reset(curl_handle);
 
     if(data && !argument.keep_resp_on_fail)
     {
@@ -320,6 +361,34 @@ struct InFlightEntry
 std::mutex inflight_map_mutex;
 std::map<std::string, std::shared_ptr<InFlightEntry>> inflight_map;
 std::atomic<uint64_t> cache_tmp_seq{0};
+std::atomic<time_t> last_cache_cleanup{0};
+
+void maybeCleanupStaleCache()
+{
+    constexpr time_t kCleanupIntervalSec = 3600;
+    time_t now = time(nullptr);
+    time_t prev = last_cache_cleanup.load(std::memory_order_relaxed);
+    if(prev != 0 && (now - prev) < kCleanupIntervalSec)
+        return;
+    if(!last_cache_cleanup.compare_exchange_strong(prev, now, std::memory_order_acq_rel))
+        return;
+
+    int max_ttl = std::max(global.cacheSubscription, std::max(global.cacheConfig, global.cacheRuleset));
+    double stale_age = std::max(7.0 * 86400.0, static_cast<double>(max_ttl) * 2.0);
+    cache_rw_lock.writeLock();
+    defer(cache_rw_lock.writeUnlock();)
+    operateFiles("cache", [now, stale_age](const std::string &file) {
+        std::string full = "cache/" + file;
+        struct stat st {};
+        if(stat(full.c_str(), &st) != 0)
+            return 0;
+        double age = difftime(now, st.st_mtime);
+        bool is_orphan_tmp = file.find(".tmp.") != std::string::npos && age > 300.0;
+        if(is_orphan_tmp || age > stale_age)
+            std::remove(full.c_str());
+        return 0;
+    });
+}
 
 void atomicFileWrite(const std::string &path, const std::string &data)
 {
@@ -474,10 +543,13 @@ std::string webGet(const std::string &url, const std::string &proxy, unsigned in
         curlGet(argument, leader_res);
         if(sf_res.return_code == 200) // success, save new cache atomically
         {
-            cache_rw_lock.writeLock();
-            defer(cache_rw_lock.writeUnlock();)
-            atomicFileWrite(path, sf_res.content);
-            atomicFileWrite(path_header, sf_res.headers);
+            {
+                cache_rw_lock.writeLock();
+                defer(cache_rw_lock.writeUnlock();)
+                atomicFileWrite(path, sf_res.content);
+                atomicFileWrite(path_header, sf_res.headers);
+            }
+            maybeCleanupStaleCache();
         }
         else
         {

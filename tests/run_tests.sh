@@ -221,6 +221,7 @@ ss://YWVzLTI1Ni1nY206cGFzcw@1.1.1.8:443#瑞士-苏黎世-CN2-by-AWS
 ss://YWVzLTI1Ni1nY206cGFzcw@1.1.1.9:443#瑞典-CU9929
 ss://YWVzLTI1Ni1nY206cGFzcw@1.1.1.10:443#欧洲专线-01
 ss://YWVzLTI1Ni1nY206cGFzcw@1.1.1.11:443#巴西-圣保罗
+ss://YWVzLTI1Ni1nY206cGFzcw@1.1.1.16:443#智利-圣地亚哥
 ss://YWVzLTI1Ni1nY206cGFzcw@1.1.1.12:443#缅甸-仰光
 ss://YWVzLTI1Ni1nY206cGFzcw@1.1.1.13:443#俄罗斯-莫斯科
 ss://YWVzLTI1Ni1nY206cGFzcw@1.1.1.14:443#中国-回国
@@ -237,6 +238,12 @@ EOF
 cat <<'EOF' | base64 -w 0 > "$TMPDIR/work/base/base/sub_surge_vless.sub"
 ss://YWVzLTI1Ni1nY206cGFzcw@3.3.3.1:443#香港-SS
 vless://11111111-1111-1111-1111-111111111111@3.3.3.2:443?encryption=none&security=reality&sni=www.apple.com&fp=chrome&pbk=abc123&sid=01ab&type=tcp&flow=xtls-rprx-vision#美国-VLESS
+EOF
+
+cat <<'EOF' | base64 -w 0 > "$TMPDIR/work/base/base/sub_fold.sub"
+ss://YWVzLTI1Ni1nY206cGFzcw@4.4.4.1:443#香港-01
+ss://YWVzLTI1Ni1nY206cGFzcw@4.4.4.2:443#日本-东京
+ss://YWVzLTI1Ni1nY206cGFzcw@4.4.4.3:443#美国-洛杉矶
 EOF
 
 cat > "$TMPDIR/work/base/base/tpl_hierarchy.ini" <<'EOF'
@@ -332,6 +339,9 @@ assert_has "$(get_group_block "$TMPDIR/s2h.yaml" "EAST_ASIA_SAFE")" "      - 日
 assert_not_has "$(get_group_block "$TMPDIR/s2h.yaml" "EAST_ASIA_SAFE")" "香港-01" "EAST_ASIA_SAFE excludes HK"
 assert_has "$(get_group_block "$TMPDIR/s2h.yaml" "NORTHERN_EUROPE")" "      - 瑞典-CU9929" "NORTHERN_EUROPE has SE"
 assert_has "$(get_group_block "$TMPDIR/s2h.yaml" "SOUTH_AMERICA")" "      - 巴西-圣保罗" "SOUTH_AMERICA has BR"
+assert_has "$(get_group_block "$TMPDIR/s2h.yaml" "SOUTH_AMERICA")" "      - 智利-圣地亚哥" "SOUTH_AMERICA has CL"
+assert_has "$(get_group_block "$TMPDIR/s2h.yaml" "BR_ONLY")" "      - 巴西-圣保罗" "BR_ONLY has BR"
+assert_not_has "$(get_group_block "$TMPDIR/s2h.yaml" "BR_ONLY")" "智利-圣地亚哥" "BR_ONLY excludes CL"
 assert_has "$(get_group_block "$TMPDIR/s2h.yaml" "CH_ONLY")" "      - 瑞士-苏黎世-CN2-by-AWS" "CH_ONLY has CH"
 assert_has "$(get_group_block "$TMPDIR/s2h.yaml" "IN_ONLY")" "      - 印度-孟买" "IN_ONLY has IN"
 echo "Suite 2 PASSED!"
@@ -361,6 +371,20 @@ curl -fsS -o "$TMPDIR/s3_sb.json" "http://127.0.0.1:25590/sub?target=singbox&con
 s3_sb="$(cat "$TMPDIR/s3_sb.json")"
 assert_has "$s3_sb" '"tag":"🇭🇰 香港节点"' "sing-box keeps HK"
 assert_not_has "$s3_sb" '"tag":"🌀 ChatGPT"' "sing-box prunes ChatGPT"
+
+# Single-country continent folding (America has only US -> folded; Asia has HK+JP -> kept)
+curl -fsS -o "$TMPDIR/s3_fold.yaml" "http://127.0.0.1:25590/sub?target=clash&new_name=true&config=base/template_offline.ini&url=base/sub_fold.sub"
+check_clash_integrity "$TMPDIR/s3_fold.yaml" "Suite3-ContinentFold"
+s3_fold_groups="$(grep "^  - name: " "$TMPDIR/s3_fold.yaml")"
+assert_has "$s3_fold_groups" "  - name: 🌏 亚洲节点" "Multi-country Asia continent kept"
+assert_has "$s3_fold_groups" "  - name: 🇺🇸 美国节点" "US country group kept"
+assert_not_has "$s3_fold_groups" "  - name: 🌎 美洲节点" "Single-country America continent folded into US"
+
+# Server-side Gzip response compression (compiled with ZLIB/CPPHTTPLIB_ZLIB_SUPPORT)
+curl -fsS -D "$TMPDIR/s3_gz_hdr.txt" --compressed -o "$TMPDIR/s3_gz.yaml" "http://127.0.0.1:25590/sub?target=clash&new_name=true&config=base/template_offline.ini&url=base/sub_full.sub"
+diff -q "$TMPDIR/s2.yaml" "$TMPDIR/s3_gz.yaml"
+assert_has "$(cat "$TMPDIR/s3_gz_hdr.txt")" "Content-Encoding: gzip" "Server returned gzip-compressed response"
+echo "Server Gzip compression: ENABLED and verified byte-identical"
 echo "Suite 3 PASSED!"
 
 kill "$SUB_PID" 2>/dev/null || true
@@ -384,6 +408,7 @@ int main() {
     std::atomic<int> sf_hits{0};
     std::atomic<bool> fail_sf{false};
     std::atomic<bool> saw_accept_encoding{false};
+    std::atomic<bool> saw_get_content_type{false};
 
     struct SubItem { const char *path; const char *b64; const char *userinfo; };
     const SubItem subs[] = {
@@ -394,9 +419,11 @@ int main() {
         {"/sub5", "c3M6Ly9ZV1Z6TFRJMU5pMW5ZMjA2Y0dGemN3QDEwLjAuMC41OjQ0MyNTdWI1LUhLCg==", "upload=500; download=600; total=2000; expire=1900000000"},
     };
     for (const auto &s : subs) {
-        svr.Get(s.path, [s, &saw_accept_encoding](const httplib::Request &req, httplib::Response &res) {
+        svr.Get(s.path, [s, &saw_accept_encoding, &saw_get_content_type](const httplib::Request &req, httplib::Response &res) {
             if (req.has_header("Accept-Encoding") && !req.get_header_value("Accept-Encoding").empty())
                 saw_accept_encoding.store(true);
+            if (req.has_header("Content-Type"))
+                saw_get_content_type.store(true);
             std::this_thread::sleep_for(std::chrono::milliseconds(800));
             if (s.userinfo[0] != '\0')
                 res.set_header("Subscription-UserInfo", s.userinfo);
@@ -426,8 +453,8 @@ int main() {
         }
         res.set_content("DOMAIN-SUFFIX,singleflight.example.com\n", "text/plain");
     });
-    svr.Get("/sf_stats", [&sf_hits, &saw_accept_encoding](const httplib::Request &, httplib::Response &res) {
-        res.set_content("hits=" + std::to_string(sf_hits.load()) + " ae=" + (saw_accept_encoding.load() ? "1" : "0") + "\n", "text/plain");
+    svr.Get("/sf_stats", [&sf_hits, &saw_accept_encoding, &saw_get_content_type](const httplib::Request &, httplib::Response &res) {
+        res.set_content("hits=" + std::to_string(sf_hits.load()) + " ae=" + (saw_accept_encoding.load() ? "1" : "0") + " get_ct=" + (saw_get_content_type.load() ? "1" : "0") + "\n", "text/plain");
     });
     svr.Get("/sf_fail_on", [&fail_sf](const httplib::Request &, httplib::Response &res) {
         fail_sf.store(true);
@@ -570,6 +597,7 @@ EOF
     echo "Singleflight stats after 6 simultaneous cold clients: $STATS"
     assert_has "$STATS" "hits=1 " "Singleflight coalesced 6 cold requests into exactly 1 upstream fetch"
     assert_has "$STATS" "ae=1" "libcurl advertised Accept-Encoding compression"
+    assert_has "$STATS" "get_ct=0" "GET requests do not send Content-Type: application/json"
 
     # Flip upstream /rule_sf to HTTP 500 and wait for 1s cache TTL expiry -> fallback to cached content!
     curl -fsS http://127.0.0.1:25591/sf_fail_on >/dev/null

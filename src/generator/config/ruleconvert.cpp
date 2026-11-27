@@ -347,7 +347,7 @@ void rulesetToClash(YAML::Node &base_rule, std::vector<RulesetContent> &ruleset_
             lineSize = strLine.size();
             if(!lineSize || strLine[0] == ';' || strLine[0] == '#' || (lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')) //empty lines and comments are ignored
                 continue;
-            if(std::none_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [strLine](const std::string& type){return startsWith(strLine, type);}))
+            if(std::none_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [&strLine](const std::string& type){return startsWith(strLine, type);}))
                 continue;
             if(strFind(strLine, "//"))
             {
@@ -375,8 +375,11 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
     std::stringstream strStrm;
     const std::string field_name = new_field_name ? "rules" : "Rule";
     std::string output_content = "\n" + field_name + ":\n";
+    output_content.reserve(65536);
     size_t total_rules = 0;
     std::unordered_set<std::string> seen_rules;
+    if(enable_rule_dedup)
+        seen_rules.reserve(4096);
 
     if(!overwrite_original_rules && base_rule[field_name].IsDefined())
     {
@@ -384,7 +387,9 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
         {
             std::string existing_rule = safe_as<std::string>(base_rule[field_name][i]);
             isDuplicateRule(seen_rules, existing_rule, enable_rule_dedup);
-            output_content += "  - " + existing_rule + "\n";
+            output_content.append("  - ");
+            output_content.append(existing_rule);
+            output_content.push_back('\n');
         }
     }
     base_rule.remove(field_name);
@@ -409,7 +414,9 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
             strLine = transformRuleToCommon(temp, strLine, rule_group);
             if(isDuplicateRule(seen_rules, strLine, enable_rule_dedup))
                 continue;
-            output_content += "  - " + strLine + "\n";
+            output_content.append("  - ");
+            output_content.append(strLine);
+            output_content.push_back('\n');
             total_rules++;
             continue;
         }
@@ -417,7 +424,7 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
         char delimiter = getLineBreak(retrieved_rules);
 
         strStrm.clear();
-        strStrm<<retrieved_rules;
+        strStrm.str(retrieved_rules);
         std::string::size_type lineSize;
         while(getline(strStrm, strLine, delimiter))
         {
@@ -427,7 +434,7 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
             lineSize = strLine.size();
             if(!lineSize || strLine[0] == ';' || strLine[0] == '#' || (lineSize >= 2 && strLine[0] == '/' && strLine[1] == '/')) //empty lines and comments are ignored
                 continue;
-            if(std::none_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [strLine](const std::string& type){ return startsWith(strLine, type); }))
+            if(std::none_of(ClashRuleTypes.begin(), ClashRuleTypes.end(), [&strLine](const std::string& type){ return startsWith(strLine, type); }))
                 continue;
             if(strFind(strLine, "//"))
             {
@@ -437,7 +444,9 @@ std::string rulesetToClashStr(YAML::Node &base_rule, std::vector<RulesetContent>
             strLine = transformRuleToCommon(temp, strLine, rule_group);
             if(isDuplicateRule(seen_rules, strLine, enable_rule_dedup))
                 continue;
-            output_content += "  - " + strLine + "\n";
+            output_content.append("  - ");
+            output_content.append(strLine);
+            output_content.push_back('\n');
             total_rules++;
         }
     }
@@ -621,22 +630,22 @@ void rulesetToSurge(INIReader &base_rule, std::vector<RulesetContent> &ruleset_c
                         continue;
                     [[fallthrough]];
                 case -1:
-                    if(!std::any_of(QuanXRuleTypes.begin(), QuanXRuleTypes.end(), [strLine](const std::string& type){return startsWith(strLine, type);}))
+                    if(!std::any_of(QuanXRuleTypes.begin(), QuanXRuleTypes.end(), [&strLine](const std::string& type){return startsWith(strLine, type);}))
                         continue;
                     break;
                 case -3:
-                    if(!std::any_of(SurfRuleTypes.begin(), SurfRuleTypes.end(), [strLine](const std::string& type){return startsWith(strLine, type);}))
+                    if(!std::any_of(SurfRuleTypes.begin(), SurfRuleTypes.end(), [&strLine](const std::string& type){return startsWith(strLine, type);}))
                         continue;
                     break;
                 default:
                     if(surge_ver > 2)
                     {
-                        if(!std::any_of(SurgeRuleTypes.begin(), SurgeRuleTypes.end(), [strLine](const std::string& type){return startsWith(strLine, type);}))
+                        if(!std::any_of(SurgeRuleTypes.begin(), SurgeRuleTypes.end(), [&strLine](const std::string& type){return startsWith(strLine, type);}))
                             continue;
                     }
                     else
                     {
-                        if(!std::any_of(Surge2RuleTypes.begin(), Surge2RuleTypes.end(), [strLine](const std::string& type){return startsWith(strLine, type);}))
+                        if(!std::any_of(Surge2RuleTypes.begin(), Surge2RuleTypes.end(), [&strLine](const std::string& type){return startsWith(strLine, type);}))
                             continue;
                     }
                 }
