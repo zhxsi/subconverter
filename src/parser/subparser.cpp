@@ -355,8 +355,9 @@ void vlessConstruct(
     commonConstruct(node, ProxyType::VLESS, group, remarks, server, port, udp, tfo, scv, tribool(), underlying_proxy);
     node.UUID = uuid;
     node.SNI = sni;
-    node.TransferProtocol = net.empty() ? "tcp" : net;
-    switch(hash_(net))
+    std::string normalized_net = (net.empty() || net == "raw") ? "tcp" : net;
+    node.TransferProtocol = normalized_net;
+    switch(hash_(normalized_net))
     {
         case "grpc"_hash:
             node.Host = host;
@@ -377,7 +378,11 @@ void vlessConstruct(
             break;
     }
     if (!alpn.empty()) {
-        node.Alpn = StringArray{alpn};
+        for (const auto &item : split(alpn, ",")) {
+            std::string trimmed = trim(item);
+            if (!trimmed.empty())
+                node.Alpn.emplace_back(trimmed);
+        }
     }
     node.Fingerprint = fingerprint;
     node.Flow = flow;
@@ -1246,7 +1251,7 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes)
         std::string obfs_password, cwnd; //hysteria2
         std::string uuid, heartbeat_interval, disable_sni, reduce_rtt, request_timeout, udp_relay_mode, congestion_controller, max_udp_relay_packet_size, max_open_streams, fast_open;   //TUIC
         std::string idle_session_check_interval, idle_session_timeout, min_idle_session;
-        std::string flow, xtls, short_id;
+        std::string flow, xtls, short_id, spider_x, support_x25519mlkem768;
         // New parameters from mihomo
         std::string ip_version, client_fingerprint, ech_config, certificate, private_key_pem, vless_encryption;
         std::string smux_protocol, ws_early_data_header_name, http_method, trojan_ss_method, trojan_ss_password;
@@ -1354,10 +1359,18 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes)
             singleproxy["uuid"] >>= uuid;
             singleproxy["servername"] >>= sni;
             net = singleproxy["network"].IsDefined() ? safe_as<std::string>(singleproxy["network"]) : "tcp";
-            if (singleproxy["alpn"].IsSequence())
-                singleproxy["alpn"][0] >>= alpn;
-            else
+            if (net.empty() || net == "raw")
+                net = "tcp";
+            StringArray alpn_list;
+            if (singleproxy["alpn"].IsSequence()) {
+                for (const auto &item : singleproxy["alpn"]) {
+                    std::string val = trim(safe_as<std::string>(item));
+                    if (!val.empty())
+                        alpn_list.emplace_back(val);
+                }
+            } else {
                 singleproxy["alpn"] >>= alpn;
+            }
             singleproxy["fingerprint"] >>= fingerprint;
             singleproxy["flow"] >>= flow;
             if (singleproxy["flow"].IsDefined())
@@ -1365,7 +1378,13 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes)
             if (singleproxy["reality-opts"].IsDefined()) {
                 singleproxy["reality-opts"]["public-key"] >>= public_key;
                 singleproxy["reality-opts"]["short-id"] >>= short_id;
+                singleproxy["reality-opts"]["spider-x"] >>= spider_x;
+                if (singleproxy["reality-opts"]["support-x25519mlkem768"].IsDefined())
+                    singleproxy["reality-opts"]["support-x25519mlkem768"] >>= support_x25519mlkem768;
             }
+            // Backward compatibility with incorrectly generated top-level values.
+            if (support_x25519mlkem768.empty())
+                singleproxy["support-x25519mlkem768"] >>= support_x25519mlkem768;
             switch (hash_(net))
             {
                 case "ws"_hash:
@@ -1409,7 +1428,9 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes)
             tls = safe_as<std::string>(singleproxy["tls"]) == "true" ? "tls" : "";
 
             vlessConstruct(node, group, ps, server, port, uuid, sni, alpn, type, net, mode, host, path, fingerprint, flow, xtls, public_key, short_id, client_fingerprint, udp, tfo, scv, underlying_proxy);
-            node.TLSSecure = tls == "tls";
+            if (!alpn_list.empty())
+                node.Alpn = alpn_list;
+            node.TLSSecure = tls == "tls" || !public_key.empty();
             // Assign new parameters to node for VLESS
             node.IpVersion = ip_version;
             node.EchEnable = ech_enable;
@@ -1418,6 +1439,9 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes)
             node.PrivateKeyPem = private_key_pem;
             singleproxy["encryption"] >>= vless_encryption;
             node.VlessEncryption = vless_encryption;
+            node.SpiderX = spider_x;
+            if (!support_x25519mlkem768.empty())
+                node.SupportX25519MLKEM768 = tribool(support_x25519mlkem768);
             // packet-encoding and xudp support - only assign if explicitly provided
             if(singleproxy["packet-encoding"].IsDefined())
             {
@@ -1437,9 +1461,15 @@ void explodeClash(Node yamlnode, std::vector<Proxy> &nodes)
                     singleproxy["ws-opts"]["early-data-header-name"] >>= ws_early_data_header_name;
                     node.WsMaxEarlyData = to_int(ws_max_early_data);
                     node.WsEarlyDataHeaderName = ws_early_data_header_name;
+                    if (singleproxy["ws-opts"]["v2ray-http-upgrade"].IsDefined())
+                        v2ray_http_upgrade = safe_as<std::string>(singleproxy["ws-opts"]["v2ray-http-upgrade"]);
+                    if (singleproxy["ws-opts"]["v2ray-http-upgrade-fast-open"].IsDefined())
+                        v2ray_http_upgrade_fast_open = safe_as<std::string>(singleproxy["ws-opts"]["v2ray-http-upgrade-fast-open"]);
                 }
-                v2ray_http_upgrade = safe_as<std::string>(singleproxy["v2ray-http-upgrade"]);
-                v2ray_http_upgrade_fast_open = safe_as<std::string>(singleproxy["v2ray-http-upgrade-fast-open"]);
+                if (v2ray_http_upgrade.is_undef())
+                    v2ray_http_upgrade = safe_as<std::string>(singleproxy["v2ray-http-upgrade"]);
+                if (v2ray_http_upgrade_fast_open.is_undef())
+                    v2ray_http_upgrade_fast_open = safe_as<std::string>(singleproxy["v2ray-http-upgrade-fast-open"]);
                 node.V2rayHttpUpgrade = v2ray_http_upgrade;
                 node.V2rayHttpUpgradeFastOpen = v2ray_http_upgrade_fast_open;
             }
@@ -2127,9 +2157,10 @@ void explodeAnyTLS(std::string anytls, Proxy &node) {
 }
 
 void explodeStdVLESS(std::string vless, Proxy &node) {
-    std::string add, port, uuid, sni, alpn, net, type, mode, host, path, fingerprint, remarks, addition, flow, xtls, public_key, short_id, security, tls;
-    tribool tfo, scv;
+    std::string add, port, uuid, sni, alpn, net, type, mode, host, path, fingerprint, client_fingerprint, remarks, addition, flow, xtls, public_key, short_id, security, tls;
+    tribool udp, tfo, scv, v2ray_http_upgrade;
     std::string decoded, userinfo, hostinfo;
+    std::string spider_x, support_x25519mlkem768, encryption;
     string_array user_parts;
 
     vless = vless.substr(8);
@@ -2178,18 +2209,25 @@ void explodeStdVLESS(std::string vless, Proxy &node) {
     if (uuid.empty()) return;
 
     if (!addition.empty()) {
-        sni = getUrlArg(addition, "sni");
+        sni = urlDecode(getUrlArg(addition, "sni"));
         if (sni.empty()) {
-            sni = getUrlArg(addition, "peer");
+            sni = urlDecode(getUrlArg(addition, "peer"));
         }
-        net = getUrlArg(addition,"type");
-        alpn = getUrlArg(addition, "alpn");
-        fingerprint = getUrlArg(addition, "hpkp");
-        flow = getUrlArg(addition, "flow");
+        net = urlDecode(getUrlArg(addition,"type"));
+        if (net.empty() || net == "raw")
+            net = "tcp";
+        alpn = urlDecode(getUrlArg(addition, "alpn"));
+        fingerprint = urlDecode(getUrlArg(addition, "hpkp"));
+        client_fingerprint = urlDecode(getUrlArg(addition, "fp"));
+        flow = urlDecode(getUrlArg(addition, "flow"));
         xtls = getUrlArg(addition, "xtls");
-        public_key = getUrlArg(addition, "pbk");
-        security = getUrlArg(addition, "security");
-        short_id = getUrlArg(addition, "sid");
+        public_key = urlDecode(getUrlArg(addition, "pbk"));
+        security = urlDecode(getUrlArg(addition, "security"));
+        short_id = urlDecode(getUrlArg(addition, "sid"));
+        spider_x = urlDecode(getUrlArg(addition, "spx"));
+        support_x25519mlkem768 = urlDecode(getUrlArg(addition, "support-x25519mlkem768"));
+        encryption = urlDecode(getUrlArg(addition, "encryption"));
+        udp = tribool(getUrlArg(addition, "udp"));
         tfo = tribool(getUrlArg(addition, "tfo"));
         std::string insecure_val = getUrlArg(addition, "insecure");
         if (insecure_val.empty())
@@ -2199,21 +2237,36 @@ void explodeStdVLESS(std::string vless, Proxy &node) {
         switch(hash_(net))
         {
             case "tcp"_hash:
+                type = urlDecode(getUrlArg(addition, "headerType"));
+                // REALITY SNI is not a TCP Host header.
+                if (type != "none")
+                    host = urlDecode(getUrlArg(addition, "host"));
+                path = urlDecode(getUrlArg(addition, "path"));
+                break;
+            case "httpupgrade"_hash:
+                net = "ws";
+                v2ray_http_upgrade = true;
+                host = urlDecode(getUrlArg(addition, "host"));
+                path = urlDecode(getUrlArg(addition, "path"));
+                break;
             case "ws"_hash:
             case "h2"_hash:
-                type = getUrlArg(addition, "headerType");
-                host = getUrlArg(addition, strFind(addition,"sni") ? "sni" : "host");
-                path = getUrlArg(addition, "path");
+            case "http"_hash:
+                type = urlDecode(getUrlArg(addition, "headerType"));
+                host = urlDecode(getUrlArg(addition, "host"));
+                path = urlDecode(getUrlArg(addition, "path"));
                 break;
             case "grpc"_hash:
-                host = getUrlArg(addition, "sni");
-                path = getUrlArg(addition, "serviceName");
-                mode = getUrlArg(addition, "mode");
+                host = urlDecode(getUrlArg(addition, "authority"));
+                if (host.empty())
+                    host = sni;
+                path = urlDecode(getUrlArg(addition, "serviceName"));
+                mode = urlDecode(getUrlArg(addition, "mode"));
                 break;
             case "quic"_hash:
-                type = getUrlArg(addition, "headerType");
-                host = getUrlArg(addition, strFind(addition,"sni") ? "sni" : "quicSecurity");
-                path = getUrlArg(addition, "key");
+                type = urlDecode(getUrlArg(addition, "headerType"));
+                host = urlDecode(getUrlArg(addition, strFind(addition,"sni") ? "sni" : "quicSecurity"));
+                path = urlDecode(getUrlArg(addition, "key"));
                 break;
             default:
                 return;
@@ -2228,8 +2281,15 @@ void explodeStdVLESS(std::string vless, Proxy &node) {
 
     if (remarks.empty())
         remarks = add + ":" + port;
-    node.TLSSecure = security == "tls" || security == "reality";
-    vlessConstruct(node, VLESS_DEFAULT_GROUP, remarks, add, port, uuid, sni, alpn, type, net, mode, host, path, fingerprint, flow, xtls, public_key, short_id, "", tribool(), tfo, scv, "");
+    vlessConstruct(node, VLESS_DEFAULT_GROUP, remarks, add, port, uuid, sni, alpn, type, net, mode, host, path, fingerprint, flow, xtls, public_key, short_id, client_fingerprint, udp, tfo, scv, "");
+    node.TLSSecure = security == "tls" || security == "reality" || !public_key.empty();
+    node.SpiderX = spider_x;
+    if (!support_x25519mlkem768.empty())
+        node.SupportX25519MLKEM768 = tribool(support_x25519mlkem768);
+    if (!encryption.empty() && encryption != "none")
+        node.VlessEncryption = encryption;
+    if (!v2ray_http_upgrade.is_undef())
+        node.V2rayHttpUpgrade = v2ray_http_upgrade;
 }
 
 void explodeVLESS(std::string vless, Proxy &node) {
@@ -3201,7 +3261,6 @@ void explodeSub(std::string sub, std::vector<Proxy> &nodes)
     {
         if(!processed && regFind(sub, "\"?(Proxy|proxies)\"?:"))
         {
-            regGetMatch(sub, R"(^(?:Proxy|proxies):$\s(?:(?:^ +?.*$| *?-.*$|)\s?)+)", 1, &sub);
             Node yamlnode = Load(sub);
             if(yamlnode.size() && (yamlnode["Proxy"].IsDefined() || yamlnode["proxies"].IsDefined()))
             {

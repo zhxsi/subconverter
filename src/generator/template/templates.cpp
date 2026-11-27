@@ -103,16 +103,61 @@ int render_template(const std::string &content, const template_args &vars, std::
         }
         all_args += "&";
     }
-    all_args.erase(all_args.size() - 1);
+    if(!all_args.empty())
+        all_args.pop_back();
     parse_json_pointer(data["request"], "_args", all_args);
     for(auto &x : vars.local_vars)
         parse_json_pointer(data["local"], x.first, x.second);
+
+    auto get_request_param = [&vars](const std::string &key, const std::string &def_val) -> std::string
+    {
+        auto iter = vars.request_params.find(key);
+        if(iter == vars.request_params.end() || iter->second.empty())
+            return def_val;
+        return iter->second;
+    };
 
     inja::Environment env;
 
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
     env.set_line_statement("#~#");
+    env.add_callback("param", 1, [&get_request_param](inja::Arguments &args)
+    {
+        return get_request_param(args.at(0)->get<std::string>(), "");
+    });
+    env.add_callback("param", 2, [&get_request_param](inja::Arguments &args)
+    {
+        return get_request_param(args.at(0)->get<std::string>(), args.at(1)->get<std::string>());
+    });
+    env.add_callback("hasParam", 1, [&vars](inja::Arguments &args)
+    {
+        return vars.request_params.find(args.at(0)->get<std::string>()) != vars.request_params.end();
+    });
+    env.add_callback("isTrue", 1, [&get_request_param](inja::Arguments &args)
+    {
+        std::string val = toLower(trim(get_request_param(args.at(0)->get<std::string>(), "")));
+        return val == "true" || val == "1" || val == "yes" || val == "on";
+    });
+    env.add_callback("isFalse", 1, [&get_request_param](inja::Arguments &args)
+    {
+        std::string val = toLower(trim(get_request_param(args.at(0)->get<std::string>(), "")));
+        return val == "false" || val == "0" || val == "no" || val == "off";
+    });
+    env.add_callback("hasToken", 2, [&get_request_param](inja::Arguments &args)
+    {
+        std::string raw = get_request_param(args.at(0)->get<std::string>(), "");
+        std::string needle = toLower(trim(args.at(1)->get<std::string>()));
+        if(raw.empty() || needle.empty())
+            return false;
+        std::string normalized = replaceAllDistinct(replaceAllDistinct(raw, "|", ","), ";", ",");
+        for(const std::string &item : split(normalized, ","))
+        {
+            if(toLower(trim(item)) == needle)
+                return true;
+        }
+        return false;
+    });
     env.add_callback("UrlEncode", 1, [](inja::Arguments &args)
     {
         std::string data = args.at(0)->get<std::string>();

@@ -8,6 +8,7 @@
 #endif // NO_JS_RUNTIME
 
 #include "config/proxygroup.h"
+#include "config/region.h"
 #include "config/regmatch.h"
 #include "parser/config/proxy.h"
 #include "utils/ini_reader/ini_reader.h"
@@ -19,6 +20,8 @@ struct extra_settings
 {
     bool enable_rule_generator = true;
     bool overwrite_original_rules = true;
+    bool enable_rule_dedup = false;
+    bool prune_empty_groups = true;
     RegexMatchConfigs rename_array;
     RegexMatchConfigs emoji_array;
     bool add_emoji = false;
@@ -41,6 +44,7 @@ struct extra_settings
     std::string clash_proxies_style = "flow";
     std::string clash_proxy_groups_style = "flow";
     bool authorized = false;
+    RegionPresetMap region_presets = getBuiltinRegionPresets();
 
     extra_settings() = default;
     extra_settings(const extra_settings&) = delete;

@@ -170,13 +170,15 @@ struct Proxy
 
     String Flow;
     tribool FlowSet;  // Flag to indicate if Flow field was explicitly set (even if empty)
-    uint32_t XTLS;
+    uint32_t XTLS = 0;
     String PacketEncoding;
     tribool PacketAddr;
     tribool GlobalPadding;
     tribool AuthenticatedLength;
     tribool XUDP;
     String ShortID;
+    String SpiderX;                         // Reality spider-x path
+    tribool SupportX25519MLKEM768;
 
     // New parameters from mihomo
     String IpVersion;                    // ip-version: ipv4/ipv6/dual/ipv4-prefer/ipv6-prefer
@@ -204,7 +206,7 @@ struct Proxy
     String VlessEncryption;              // mlkem768x25519plus.native/xorpub/random.1rtt/0rtt
     
     // WebSocket additional options
-    uint32_t WsMaxEarlyData;
+    uint32_t WsMaxEarlyData = 0;
     String WsEarlyDataHeaderName;
     tribool V2rayHttpUpgrade;
     tribool V2rayHttpUpgradeFastOpen;

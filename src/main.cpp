@@ -8,6 +8,7 @@
 
 #include "config/ruleset.h"
 #include "handler/interfaces.h"
+#include "handler/multithread.h"
 #include "handler/webget.h"
 #include "handler/settings.h"
 #include "script/cron.h"
@@ -165,7 +166,11 @@ int main(int argc, char *argv[])
     readConf();
     //vfs::vfs_read("vfs.ini");
     if(!global.updateRulesetOnRequest)
-        refreshRulesets(global.customRulesets, global.rulesetsContent);
+    {
+        std::vector<RulesetContent> refreshed;
+        refreshRulesets(global.customRulesets, refreshed);
+        safe_set_rulesets(std::move(refreshed));
+    }
 
     std::string env_api_mode = getEnv("API_MODE"), env_managed_prefix = getEnv("MANAGED_PREFIX"), env_token = getEnv("API_TOKEN");
     global.APIMode = tribool().parse(toLower(env_api_mode)).get(global.APIMode);
@@ -200,7 +205,9 @@ int main(int argc, char *argv[])
                 return "Forbidden\n";
             }
         }
-        refreshRulesets(global.customRulesets, global.rulesetsContent);
+        std::vector<RulesetContent> refreshed;
+        refreshRulesets(global.customRulesets, refreshed);
+        safe_set_rulesets(std::move(refreshed));
         return "done\n";
     });
 
@@ -217,7 +224,11 @@ int main(int argc, char *argv[])
         }
         readConf();
         if(!global.updateRulesetOnRequest)
-            refreshRulesets(global.customRulesets, global.rulesetsContent);
+        {
+            std::vector<RulesetContent> refreshed;
+            refreshRulesets(global.customRulesets, refreshed);
+            safe_set_rulesets(std::move(refreshed));
+        }
         return "done\n";
     });
 
@@ -245,7 +256,11 @@ int main(int argc, char *argv[])
 
         readConf();
         if(!global.updateRulesetOnRequest)
-            refreshRulesets(global.customRulesets, global.rulesetsContent);
+        {
+            std::vector<RulesetContent> refreshed;
+            refreshRulesets(global.customRulesets, refreshed);
+            safe_set_rulesets(std::move(refreshed));
+        }
         return "done\n";
     });
 

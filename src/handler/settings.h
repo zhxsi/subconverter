@@ -4,6 +4,7 @@
 #include <string>
 
 #include "config/crontask.h"
+#include "config/region.h"
 #include "config/regmatch.h"
 #include "config/proxygroup.h"
 #include "config/ruleset.h"
@@ -23,10 +24,10 @@ struct Settings
     RegexMatchConfigs streamNodeRules, timeNodeRules;
     std::vector<RulesetContent> rulesetsContent;
     std::string listenAddress = "127.0.0.1", defaultUrls, insertUrls, managedConfigPrefix;
-    int listenPort = 25500, maxPendingConns = 10, maxConcurThreads = 4;
-    bool prependInsert = true, skipFailedLinks = false;
-    bool APIMode = true, writeManagedConfig = false, enableRuleGen = true, updateRulesetOnRequest = false, overwriteOriginalRules = true;
-    bool printDbgInfo = false, CFWChildProcess = false, appendUserinfo = true, asyncFetchRuleset = false, surgeResolveHostname = true;
+    int listenPort = 25500, maxPendingConns = 10, maxConcurThreads = 8;
+    bool prependInsert = true;
+    bool APIMode = true, writeManagedConfig = false, enableRuleGen = true, updateRulesetOnRequest = false, overwriteOriginalRules = true, enableRuleDedup = false, pruneEmptyGroups = true;
+    bool printDbgInfo = false, CFWChildProcess = false, appendUserinfo = true, asyncFetchRuleset = true, surgeResolveHostname = true;
     std::string accessToken, basePath = "base";
     std::string custom_group;
     int logLevel = LOG_LEVEL_VERBOSE;
@@ -44,6 +45,7 @@ struct Settings
     //preferences
     bool reloadConfOnRequest = false;
     RegexMatchConfigs renames, emojis;
+    RegionRuleConfigs regionRules;
     bool addEmoji = false, removeEmoji = false, appendType = false, filterDeprecated = true;
     tribool UDPFlag, TFOFlag, skipCertVerify, TLS13Flag, enableInsert;
     bool enableSort = false, updateStrict = false;
@@ -59,11 +61,11 @@ struct Settings
     std::string surgeSSRPath, quanXDevID;
 
     //cache system
-    bool serveCacheOnFetchFail = false;
+    bool serveCacheOnFetchFail = true;
     int cacheSubscription = 60, cacheConfig = 300, cacheRuleset = 21600;
 
     //limits
-    size_t maxAllowedRulesets = 64, maxAllowedRules = 32768;
+    size_t maxAllowedRulesets = 256, maxAllowedRules = 32768;
     bool scriptCleanContext = false;
 
     //cron system
@@ -87,10 +89,13 @@ struct ExternalConfig
     std::string singbox_rule_base;
     RegexMatchConfigs rename;
     RegexMatchConfigs emoji;
+    RegionRuleConfigs region_rules;
     string_array include;
     string_array exclude;
     template_args *tpl_args = nullptr;
     bool overwrite_original_rules = false;
+    bool enable_rule_dedup = false;
+    bool prune_empty_groups = true;
     bool enable_rule_generator = true;
     tribool add_emoji;
     tribool remove_old_emoji;

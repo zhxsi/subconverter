@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <iostream>
 #include <numeric>
+#include <set>
 #include <cmath>
 #include <climits>
 
@@ -22,6 +23,11 @@
 #include "utils/yamlcpp_extra.h"
 #include "nodemanip.h"
 #include "ruleconvert.h"
+
+static std::string quoteClashShortId(const std::string &content)
+{
+    return regReplace(content, "(short-id:\\s*)([A-Za-z0-9_-]+)", "$1\\\"$2\\\"", true);
+}
 
 extern string_array ss_ciphers, ssr_ciphers;
 
@@ -111,7 +117,7 @@ bool matchRange(const std::string &range, int target)
     return match;
 }
 
-bool applyMatcher(const std::string &rule, std::string &real_rule, const Proxy &node)
+bool applyMatcher(const std::string &rule, std::string &real_rule, const Proxy &node, const RegionPresetMap *region_presets)
 {
     std::string target, ret_real_rule;
     static const std::string groupid_regex = R"(^!!(?:GROUPID|INSERT)=([\d\-+!,]+)(?:!!(.*))?$)", group_regex = R"(^!!(?:GROUP)=(.+?)(?:!!(.*))?$)";
@@ -120,6 +126,7 @@ bool applyMatcher(const std::string &rule, std::string &real_rule, const Proxy &
         {ProxyType::Shadowsocks,  "SS"},
         {ProxyType::ShadowsocksR, "SSR"},
         {ProxyType::VMess,        "VMESS"},
+        {ProxyType::VLESS,        "VLESS"},
         {ProxyType::Trojan,       "TROJAN"},
         {ProxyType::Snell,        "SNELL"},
         {ProxyType::HTTP,         "HTTP"},
@@ -131,7 +138,22 @@ bool applyMatcher(const std::string &rule, std::string &real_rule, const Proxy &
         {ProxyType::TUIC,    "TUIC"},
         {ProxyType::AnyTLS,    "ANYTLS"}
     };
-    if(startsWith(rule, "!!GROUP="))
+    if(startsWith(rule, "!!REGION="))
+    {
+        std::string body = rule.substr(9);
+        std::string::size_type sep = body.find("!!");
+        std::string spec_list = sep == std::string::npos ? body : body.substr(0, sep);
+        real_rule = sep == std::string::npos ? "" : body.substr(sep + 2);
+        const RegionPresetMap &presets = region_presets ? *region_presets : getBuiltinRegionPresets();
+        string_array regexes = expandRegionSpecToRegexes(spec_list, presets);
+        for(const std::string &reg : regexes)
+        {
+            if(regFind(node.Remark, reg))
+                return true;
+        }
+        return false;
+    }
+    else if(startsWith(rule, "!!GROUP="))
     {
         regGetMatch(rule, group_regex, 3, 0, &target, &ret_real_rule);
         real_rule = ret_real_rule;
@@ -148,9 +170,10 @@ bool applyMatcher(const std::string &rule, std::string &real_rule, const Proxy &
     {
         regGetMatch(rule, type_regex, 3, 0, &target, &ret_real_rule);
         real_rule = ret_real_rule;
-        if(node.Type == ProxyType::Unknown)
+        auto iter = types.find(node.Type);
+        if(iter == types.end())
             return false;
-        return regMatch(types.at(node.Type), target);
+        return regMatch(iter->second, target);
     }
     else if(startsWith(rule, "!!PORT="))
     {
@@ -220,17 +243,189 @@ void groupGenerate(const std::string &rule, std::vector<Proxy> &nodelist, string
         }, global.scriptCleanContext);
     }
 #endif // NO_JS_RUNTIME
+    else if(startsWith(rule, "!!REGION="))
+    {
+        // Preserve region priority order when multiple comma-separated regions are specified.
+        std::string body = rule.substr(9);
+        std::string::size_type sep = body.find("!!");
+        std::string spec_list = sep == std::string::npos ? body : body.substr(0, sep);
+        std::string tail_regex = sep == std::string::npos ? "" : body.substr(sep + 2);
+        string_array regexes = expandRegionSpecToRegexes(spec_list, ext.region_presets);
+        for(const std::string &reg : regexes)
+        {
+            for(Proxy &x : nodelist)
+            {
+                if(regFind(x.Remark, reg) && (tail_regex.empty() || regFind(x.Remark, tail_regex)) && std::find(filtered_nodelist.begin(), filtered_nodelist.end(), x.Remark) == filtered_nodelist.end())
+                    filtered_nodelist.emplace_back(x.Remark);
+            }
+        }
+    }
     else
     {
         for(Proxy &x : nodelist)
         {
-            if(applyMatcher(rule, real_rule, x) && (real_rule.empty() || regFind(x.Remark, real_rule)) && std::find(filtered_nodelist.begin(), filtered_nodelist.end(), x.Remark) == filtered_nodelist.end())
+            if(applyMatcher(rule, real_rule, x, &ext.region_presets) && (real_rule.empty() || regFind(x.Remark, real_rule)) && std::find(filtered_nodelist.begin(), filtered_nodelist.end(), x.Remark) == filtered_nodelist.end())
                 filtered_nodelist.emplace_back(x.Remark);
         }
     }
 }
 
-void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGroupConfigs &extra_proxy_group, bool clashR, extra_settings &ext)
+static bool isBuiltinPolicyName(const std::string &name)
+{
+    std::string upper = toUpper(trim(name));
+    return upper == "DIRECT" || upper == "REJECT" || upper == "REJECT-TINYGIF"
+        || upper == "REJECT-DROP" || upper == "PASS" || upper == "COMPATIBLE"
+        || upper == "GLOBAL";
+}
+
+static ProxyGroupConfigs pruneEmptyProxyGroups(std::vector<Proxy> &nodelist, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext, std::set<std::string> *pruned_names = nullptr)
+{
+    if(!ext.prune_empty_groups || extra_proxy_group.empty())
+        return extra_proxy_group;
+
+    std::set<std::string> defined_groups;
+    for(const ProxyGroupConfig &g : extra_proxy_group)
+        defined_groups.emplace(g.Name);
+
+    struct GroupMeta
+    {
+        bool always_keep = false;
+        bool has_node_matcher = false;
+        bool has_matched_node = false;
+        bool has_external_ref = false;
+        string_array child_refs;
+    };
+
+    std::vector<GroupMeta> metas(extra_proxy_group.size());
+    std::set<std::string> alive;
+
+    for(size_t i = 0; i < extra_proxy_group.size(); ++i)
+    {
+        const ProxyGroupConfig &g = extra_proxy_group[i];
+        GroupMeta &m = metas[i];
+
+        if(!g.UsingProvider.empty() || g.Type == ProxyGroupType::SSID)
+        {
+            m.always_keep = true;
+            alive.emplace(g.Name);
+            continue;
+        }
+
+        string_array matched_nodes;
+        for(const std::string &rule : g.Proxies)
+        {
+            if(startsWith(rule, "[]"))
+            {
+                std::string ref = rule.substr(2);
+                if(isBuiltinPolicyName(ref) || !defined_groups.count(ref))
+                    m.has_external_ref = true;
+                else
+                    m.child_refs.emplace_back(std::move(ref));
+            }
+            else
+            {
+                m.has_node_matcher = true;
+                if(matched_nodes.empty())
+                    groupGenerate(rule, nodelist, matched_nodes, false, ext);
+            }
+        }
+        m.has_matched_node = std::any_of(matched_nodes.begin(), matched_nodes.end(), [](const std::string &s) { return !trim(s).empty(); });
+
+        if(m.has_node_matcher)
+        {
+            if(m.has_matched_node)
+                alive.emplace(g.Name);
+        }
+        else if(m.has_external_ref || !m.child_refs.empty())
+        {
+            alive.emplace(g.Name);
+        }
+    }
+
+    // Fixed-point pruning: drop pure composite groups whose referenced child groups all became empty.
+    bool changed = true;
+    while(changed)
+    {
+        changed = false;
+        for(size_t i = 0; i < extra_proxy_group.size(); ++i)
+        {
+            const ProxyGroupConfig &g = extra_proxy_group[i];
+            const GroupMeta &m = metas[i];
+            if(!alive.count(g.Name) || m.always_keep || m.has_node_matcher || m.has_external_ref)
+                continue;
+
+            bool has_alive_child = false;
+            for(const std::string &ref : m.child_refs)
+            {
+                if(ref != g.Name && alive.count(ref))
+                {
+                    has_alive_child = true;
+                    break;
+                }
+            }
+            if(!has_alive_child)
+            {
+                alive.erase(g.Name);
+                changed = true;
+            }
+        }
+    }
+
+    std::set<std::string> pruned;
+    for(const std::string &name : defined_groups)
+    {
+        if(!alive.count(name))
+            pruned.emplace(name);
+    }
+
+    if(pruned_names)
+        *pruned_names = pruned;
+
+    if(pruned.empty())
+        return extra_proxy_group;
+
+    ProxyGroupConfigs filtered;
+    filtered.reserve(extra_proxy_group.size() - pruned.size());
+    for(const ProxyGroupConfig &g : extra_proxy_group)
+    {
+        if(!alive.count(g.Name))
+            continue;
+        if(g.Type == ProxyGroupType::SSID)
+        {
+            filtered.emplace_back(g);
+            continue;
+        }
+        ProxyGroupConfig copy = g;
+        copy.Proxies.clear();
+        copy.Proxies.reserve(g.Proxies.size());
+        for(const std::string &rule : g.Proxies)
+        {
+            if(startsWith(rule, "[]") && pruned.count(rule.substr(2)))
+                continue;
+            copy.Proxies.emplace_back(rule);
+        }
+        filtered.emplace_back(std::move(copy));
+    }
+    return filtered;
+}
+
+static std::vector<RulesetContent> filterPrunedRulesets(const std::vector<RulesetContent> &ruleset_content_array, const std::set<std::string> &pruned_names)
+{
+    if(pruned_names.empty())
+        return ruleset_content_array;
+
+    std::vector<RulesetContent> result;
+    result.reserve(ruleset_content_array.size());
+    for(const RulesetContent &rc : ruleset_content_array)
+    {
+        if(pruned_names.count(rc.rule_group))
+            continue;
+        result.emplace_back(rc);
+    }
+    return result;
+}
+
+static void proxyToClashImpl(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGroupConfigs &extra_proxy_group, bool clashR, extra_settings &ext, std::set<std::string> *pruned_groups = nullptr)
 {
     YAML::Node proxies, original_groups;
     std::vector<Proxy> nodelist;
@@ -616,7 +811,7 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
             break;
         case ProxyType::VLESS:
             singleproxy["type"] = "vless";
-            singleproxy["tls"] = true;
+            singleproxy["tls"] = x.TLSSecure || !x.PublicKey.empty();
             // Output packet-encoding, xudp, packet-addr only if explicitly set
             if (!x.PacketEncoding.empty())
                 singleproxy["packet-encoding"] = x.PacketEncoding;
@@ -630,11 +825,26 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
                 singleproxy["servername"] = x.SNI;
             if (!x.Alpn.empty())
                 singleproxy["alpn"] = x.Alpn;
+            if (!x.VlessEncryption.empty())
+                singleproxy["encryption"] = x.VlessEncryption;
+            if (!x.IpVersion.empty())
+                singleproxy["ip-version"] = x.IpVersion;
+            if (!x.EchEnable.is_undef() || !x.EchConfig.empty()) {
+                if (!x.EchEnable.is_undef())
+                    singleproxy["ech-opts"]["enable"] = x.EchEnable.get();
+                if (!x.EchConfig.empty())
+                    singleproxy["ech-opts"]["config"] = x.EchConfig;
+            }
+            if (!x.Certificate.empty())
+                singleproxy["certificate"] = x.Certificate;
+            if (!x.PrivateKeyPem.empty())
+                singleproxy["private-key"] = x.PrivateKeyPem;
 
             switch(hash_(x.TransferProtocol))
             {
                 case "tcp"_hash:
-                    if(!x.Host.empty())
+                    // RAW/TCP REALITY does not use an HTTP Host header.
+                    if (x.PublicKey.empty() && !x.Host.empty())
                         singleproxy["host"] = x.Host;
                     if(!x.Path.empty())
                         singleproxy["path"] = x.Path;
@@ -649,6 +859,14 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
                             singleproxy["ws-opts"]["headers"]["Host"] = x.Host;
                         if(!x.Edge.empty())
                             singleproxy["ws-opts"]["headers"]["Edge"] = x.Edge;
+                        if(x.WsMaxEarlyData > 0)
+                            singleproxy["ws-opts"]["max-early-data"] = x.WsMaxEarlyData;
+                        if(!x.WsEarlyDataHeaderName.empty())
+                            singleproxy["ws-opts"]["early-data-header-name"] = x.WsEarlyDataHeaderName;
+                        if(!x.V2rayHttpUpgrade.is_undef())
+                            singleproxy["ws-opts"]["v2ray-http-upgrade"] = x.V2rayHttpUpgrade.get();
+                        if(!x.V2rayHttpUpgradeFastOpen.is_undef())
+                            singleproxy["ws-opts"]["v2ray-http-upgrade-fast-open"] = x.V2rayHttpUpgradeFastOpen.get();
                     }
                     else
                     {
@@ -686,7 +904,9 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
                     break;
             }
 
-            if (!x.Fingerprint.empty())
+            // REALITY uses client-fingerprint; top-level fingerprint is only for
+            // TLS certificate pinning, not a uTLS identifier.
+            if (x.PublicKey.empty() && !x.Fingerprint.empty())
                 singleproxy["fingerprint"] = x.Fingerprint;
             if (x.XTLS == 2) {
                 singleproxy["flow"] = "xtls-rprx-vision";
@@ -697,9 +917,16 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
                 // Fallback for backward compatibility
                 singleproxy["flow"] = x.Flow;
             }
-            if (!x.PublicKey.empty() && !x.ShortID.empty()) {
+            if (!x.PublicKey.empty()) {
                 singleproxy["reality-opts"]["public-key"] = x.PublicKey;
-                singleproxy["reality-opts"]["short-id"] = x.ShortID;
+                if (!x.ShortID.empty()) {
+                    singleproxy["reality-opts"]["short-id"] = x.ShortID;
+                    singleproxy["reality-opts"]["short-id"].SetTag("!");
+                }
+                if (!x.SpiderX.empty())
+                    singleproxy["reality-opts"]["spider-x"] = x.SpiderX;
+                if (!x.SupportX25519MLKEM768.is_undef())
+                    singleproxy["reality-opts"]["support-x25519mlkem768"] = x.SupportX25519MLKEM768.get();
                 if (!x.ClientFingerprint.empty()) {
                     singleproxy["client-fingerprint"] = x.ClientFingerprint;
                 } else if (!x.Fingerprint.empty()) {
@@ -707,6 +934,8 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
                 } else {
                     singleproxy["client-fingerprint"] = "random";
                 }
+            } else if (!x.ClientFingerprint.empty()) {
+                singleproxy["client-fingerprint"] = x.ClientFingerprint;
             }
             if (!scv.is_undef())
                 singleproxy["skip-cert-verify"] = scv.get();
@@ -718,8 +947,8 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
         // UDP is not supported yet in clash using snell
         // sees in https://dreamacro.github.io/clash/configuration/outbound.html#snell
         // Output UDP field when explicitly provided (true or false)
-        if(!x.UDP.is_undef() && x.Type != ProxyType::Snell)
-            singleproxy["udp"] = x.UDP.get();
+        if(!udp.is_undef() && x.Type != ProxyType::Snell)
+            singleproxy["udp"] = udp.get();
         if(!tfo.is_undef())
             singleproxy["tfo"] = tfo.get();
         if(proxy_block)
@@ -748,7 +977,20 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
         yamlnode["Proxy"] = proxies;
 
 
-    for(const ProxyGroupConfig &x : extra_proxy_group)
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, pruned_groups);
+    if(pruned_groups && !pruned_groups->empty() && original_groups.IsSequence())
+    {
+        YAML::Node kept_original_groups;
+        for(const auto &original_group : original_groups)
+        {
+            if(original_group["name"].IsDefined() && pruned_groups->count(original_group["name"].as<std::string>()))
+                continue;
+            kept_original_groups.push_back(original_group);
+        }
+        original_groups = kept_original_groups;
+    }
+
+    for(const ProxyGroupConfig &x : active_proxy_group)
     {
         YAML::Node singlegroup;
         string_array filtered_nodelist;
@@ -777,6 +1019,8 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
             singlegroup["url"] = x.Url;
             if(x.Interval > 0)
                 singlegroup["interval"] = x.Interval;
+            if(x.Timeout > 0)
+                singlegroup["timeout"] = x.Timeout * 1000;
             if(x.Tolerance > 0)
                 singlegroup["tolerance"] = x.Tolerance;
             break;
@@ -826,6 +1070,11 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGr
         yamlnode["Proxy Group"] = original_groups;
 }
 
+void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode, const ProxyGroupConfigs &extra_proxy_group, bool clashR, extra_settings &ext)
+{
+    proxyToClashImpl(nodes, yamlnode, extra_proxy_group, clashR, ext, nullptr);
+}
+
 std::string proxyToClash(std::vector<Proxy> &nodes, const std::string &base_conf, std::vector<RulesetContent> &ruleset_content_array, const ProxyGroupConfigs &extra_proxy_group, bool clashR, extra_settings &ext)
 {
     YAML::Node yamlnode;
@@ -840,29 +1089,22 @@ std::string proxyToClash(std::vector<Proxy> &nodes, const std::string &base_conf
         return "";
     }
 
-    proxyToClash(nodes, yamlnode, extra_proxy_group, clashR, ext);
+    std::set<std::string> pruned_groups;
+    proxyToClashImpl(nodes, yamlnode, extra_proxy_group, clashR, ext, &pruned_groups);
 
     if(ext.nodelist)
-    {
-        std::string output = YAML::Dump(yamlnode);
-        // 为 short-id 添加引号，避免被解析为数字
-        output = regReplace(output, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
-        return output;
-    }
+        return quoteClashShortId(YAML::Dump(yamlnode));
 
     /*
     if(ext.enable_rule_generator)
-        rulesetToClash(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.clash_new_field_name);
+        rulesetToClash(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.clash_new_field_name);
 
     return YAML::Dump(yamlnode);
     */
     if(!ext.enable_rule_generator)
-    {
-        std::string output = YAML::Dump(yamlnode);
-        // 为 short-id 添加引号，避免被解析为数字
-        output = regReplace(output, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
-        return output;
-    }
+        return quoteClashShortId(YAML::Dump(yamlnode));
+
+    std::vector<RulesetContent> active_rulesets = filterPrunedRulesets(ruleset_content_array, pruned_groups);
 
     if(!ext.managed_config_prefix.empty() || ext.clash_script)
     {
@@ -874,19 +1116,13 @@ std::string proxyToClash(std::vector<Proxy> &nodes, const std::string &base_conf
                 yamlnode["mode"] = ext.clash_script ? "Script" : "Rule";
         }
 
-        renderClashScript(yamlnode, ruleset_content_array, ext.managed_config_prefix, ext.clash_script, ext.overwrite_original_rules, ext.clash_classical_ruleset);
-        std::string output = YAML::Dump(yamlnode);
-        // 为 short-id 添加引号，避免被解析为数字
-        output = regReplace(output, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
-        return output;
+        renderClashScript(yamlnode, active_rulesets, ext.managed_config_prefix, ext.clash_script, ext.overwrite_original_rules, ext.clash_classical_ruleset);
+        return quoteClashShortId(YAML::Dump(yamlnode));
     }
 
-    std::string output_content = rulesetToClashStr(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.clash_new_field_name);
-    std::string yaml_dump = YAML::Dump(yamlnode);
-    // 为 short-id 添加引号，避免被解析为数字
-    yaml_dump = regReplace(yaml_dump, "short-id: ([0-9a-fA-F]+)", "short-id: \"$1\"");
-    output_content.insert(0, yaml_dump);
-    //rulesetToClash(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.clash_new_field_name);
+    std::string output_content = rulesetToClashStr(yamlnode, active_rulesets, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.clash_new_field_name);
+    output_content.insert(0, quoteClashShortId(YAML::Dump(yamlnode)));
+    //rulesetToClash(yamlnode, ruleset_content_array, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.clash_new_field_name);
     //std::string output_content = YAML::Dump(yamlnode);
 
     return output_content;
@@ -1163,7 +1399,9 @@ std::string proxyToSurge(std::vector<Proxy> &nodes, const std::string &base_conf
     ini.set_current_section("Proxy Group");
     ini.get_items(original_groups);
     ini.erase_section();
-    for(const ProxyGroupConfig &x : extra_proxy_group)
+    std::set<std::string> pruned_groups;
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups);
+    for(const ProxyGroupConfig &x : active_proxy_group)
     {
         string_array filtered_nodelist;
         std::string group;
@@ -1238,7 +1476,10 @@ std::string proxyToSurge(std::vector<Proxy> &nodes, const std::string &base_conf
     }
 
     if(ext.enable_rule_generator)
-        rulesetToSurge(ini, ruleset_content_array, surge_ver, ext.overwrite_original_rules, ext.managed_config_prefix);
+    {
+        std::vector<RulesetContent> active_rulesets = filterPrunedRulesets(ruleset_content_array, pruned_groups);
+        rulesetToSurge(ini, active_rulesets, surge_ver, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.managed_config_prefix);
+    }
 
     return ini.to_string();
 }
@@ -1539,7 +1780,9 @@ void proxyToQuan(std::vector<Proxy> &nodes, INIReader &ini, std::vector<RulesetC
     ini.set_current_section("POLICY");
     ini.erase_section();
 
-    for(const ProxyGroupConfig &x : extra_proxy_group)
+    std::set<std::string> pruned_groups;
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups);
+    for(const ProxyGroupConfig &x : active_proxy_group)
     {
         string_array filtered_nodelist;
         std::string type;
@@ -1600,7 +1843,10 @@ void proxyToQuan(std::vector<Proxy> &nodes, INIReader &ini, std::vector<RulesetC
     }
 
     if(ext.enable_rule_generator)
-        rulesetToSurge(ini, ruleset_content_array, -2, ext.overwrite_original_rules, "");
+    {
+        std::vector<RulesetContent> active_rulesets = filterPrunedRulesets(ruleset_content_array, pruned_groups);
+        rulesetToSurge(ini, active_rulesets, -2, ext.overwrite_original_rules, ext.enable_rule_dedup, "");
+    }
 }
 
 std::string proxyToQuanX(std::vector<Proxy> &nodes, const std::string &base_conf, std::vector<RulesetContent> &ruleset_content_array, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext)
@@ -1866,7 +2112,9 @@ void proxyToQuanX(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Ruleset
     ini.get_items(original_groups);
     ini.erase_section();
 
-    for(const ProxyGroupConfig &x : extra_proxy_group)
+    std::set<std::string> pruned_groups;
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups);
+    for(const ProxyGroupConfig &x : active_proxy_group)
     {
         std::string type;
         string_array filtered_nodelist;
@@ -1938,7 +2186,10 @@ void proxyToQuanX(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Ruleset
     }
 
     if(ext.enable_rule_generator)
-        rulesetToSurge(ini, ruleset_content_array, -1, ext.overwrite_original_rules, ext.managed_config_prefix);
+    {
+        std::vector<RulesetContent> active_rulesets = filterPrunedRulesets(ruleset_content_array, pruned_groups);
+        rulesetToSurge(ini, active_rulesets, -1, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.managed_config_prefix);
+    }
 }
 
 std::string proxyToSSD(std::vector<Proxy> &nodes, std::string &group, std::string &userinfo, extra_settings &ext)
@@ -1972,8 +2223,13 @@ std::string proxyToSSD(std::vector<Proxy> &nodes, std::string &group, std::strin
         {
             const time_t rawtime = to_int(expiry);
             char buffer[30];
-            struct tm *dt = localtime(&rawtime);
-            strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M", dt);
+            struct tm dt {};
+#ifdef _WIN32
+            localtime_s(&dt, &rawtime);
+#else
+            localtime_r(&rawtime, &dt);
+#endif
+            strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M", &dt);
             writer.Key("expiry");
             writer.String(buffer);
         }
@@ -2142,7 +2398,9 @@ void proxyToMellow(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Rulese
 
     ini.set_current_section("EndpointGroup");
 
-    for(const ProxyGroupConfig &x : extra_proxy_group)
+    std::set<std::string> pruned_groups;
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups);
+    for(const ProxyGroupConfig &x : active_proxy_group)
     {
         string_array filtered_nodelist;
         url.clear();
@@ -2192,7 +2450,10 @@ void proxyToMellow(std::vector<Proxy> &nodes, INIReader &ini, std::vector<Rulese
     }
 
     if(ext.enable_rule_generator)
-        rulesetToSurge(ini, ruleset_content_array, 0, ext.overwrite_original_rules, "");
+    {
+        std::vector<RulesetContent> active_rulesets = filterPrunedRulesets(ruleset_content_array, pruned_groups);
+        rulesetToSurge(ini, active_rulesets, 0, ext.overwrite_original_rules, ext.enable_rule_dedup, "");
+    }
 }
 
 std::string proxyToLoon(std::vector<Proxy> &nodes, const std::string &base_conf, std::vector<RulesetContent> &ruleset_content_array, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext)
@@ -2354,7 +2615,9 @@ std::string proxyToLoon(std::vector<Proxy> &nodes, const std::string &base_conf,
     ini.get_items(original_groups);
     ini.erase_section();
 
-    for(const ProxyGroupConfig &x : extra_proxy_group)
+    std::set<std::string> pruned_groups;
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, &pruned_groups);
+    for(const ProxyGroupConfig &x : active_proxy_group)
     {
         string_array filtered_nodelist;
         std::string group, group_extra;
@@ -2426,7 +2689,10 @@ std::string proxyToLoon(std::vector<Proxy> &nodes, const std::string &base_conf,
     }
 
     if(ext.enable_rule_generator)
-        rulesetToSurge(ini, ruleset_content_array, -4, ext.overwrite_original_rules, ext.managed_config_prefix);
+    {
+        std::vector<RulesetContent> active_rulesets = filterPrunedRulesets(ruleset_content_array, pruned_groups);
+        rulesetToSurge(ini, active_rulesets, -4, ext.overwrite_original_rules, ext.enable_rule_dedup, ext.managed_config_prefix);
+    }
 
     return ini.to_string();
 }
@@ -2506,7 +2772,7 @@ static rapidjson::Value stringArrayToJsonArray(const std::string &array, const s
     return result;
 }
 
-void proxyToSingBox(std::vector<Proxy> &nodes, rapidjson::Document &json, std::vector<RulesetContent> &ruleset_content_array, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext) {
+static void proxyToSingBoxImpl(std::vector<Proxy> &nodes, rapidjson::Document &json, std::vector<RulesetContent> &ruleset_content_array, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext, std::set<std::string> *pruned_groups = nullptr) {
     using namespace rapidjson_ext;
     rapidjson::Document::AllocatorType &allocator = json.GetAllocator();
     rapidjson::Value outbounds(rapidjson::kArrayType), route(rapidjson::kArrayType);
@@ -2820,19 +3086,24 @@ void proxyToSingBox(std::vector<Proxy> &nodes, rapidjson::Document &json, std::v
                     tls.AddMember("alpn", alpn, allocator);
                 }
 
-                if (!x.PublicKey.empty() && !x.ShortID.empty()) {
+                if (!x.PublicKey.empty()) {
                     rapidjson::Value reality(rapidjson::kObjectType);
                     reality.AddMember("enabled", true, allocator);
-                    if (!x.PublicKey.empty())
-                        reality.AddMember("public_key", rapidjson::StringRef(x.PublicKey.c_str()), allocator);
+                    reality.AddMember("public_key", rapidjson::StringRef(x.PublicKey.c_str()), allocator);
                     if (!x.ShortID.empty())
                         reality.AddMember("short_id", rapidjson::StringRef(x.ShortID.c_str()), allocator);
                     tls.AddMember("reality", reality, allocator);
 
                     rapidjson::Value utls(rapidjson::kObjectType);
-                    utls.AddMember("enabled",true,allocator);
-                    std::array<std::string, 6> fingerprints = {"chrome", "firefox", "safari", "ios", "edge", "qq"};
-                    utls.AddMember("fingerprint", rapidjson::Value(fingerprints[rand() % fingerprints.size()].c_str(), allocator), allocator);
+                    utls.AddMember("enabled", true, allocator);
+                    if (!x.ClientFingerprint.empty()) {
+                        utls.AddMember("fingerprint", rapidjson::StringRef(x.ClientFingerprint.c_str()), allocator);
+                    } else if (!x.Fingerprint.empty()) {
+                        utls.AddMember("fingerprint", rapidjson::StringRef(x.Fingerprint.c_str()), allocator);
+                    } else {
+                        std::array<std::string, 6> fingerprints = {"chrome", "firefox", "safari", "ios", "edge", "qq"};
+                        utls.AddMember("fingerprint", rapidjson::Value(fingerprints[rand() % fingerprints.size()].c_str(), allocator), allocator);
+                    }
                     tls.AddMember("utls", utls, allocator);
                 }
 
@@ -2894,7 +3165,8 @@ void proxyToSingBox(std::vector<Proxy> &nodes, rapidjson::Document &json, std::v
         return;
     }
 
-    for (const ProxyGroupConfig &x: extra_proxy_group)
+    ProxyGroupConfigs active_proxy_group = pruneEmptyProxyGroups(nodelist, extra_proxy_group, ext, pruned_groups);
+    for (const ProxyGroupConfig &x: active_proxy_group)
     {
         string_array filtered_nodelist;
         std::string type;
@@ -2960,6 +3232,11 @@ void proxyToSingBox(std::vector<Proxy> &nodes, rapidjson::Document &json, std::v
     json | AddMemberOrReplace("outbounds", outbounds, allocator);
 }
 
+void proxyToSingBox(std::vector<Proxy> &nodes, rapidjson::Document &json, std::vector<RulesetContent> &ruleset_content_array, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext)
+{
+    proxyToSingBoxImpl(nodes, json, ruleset_content_array, extra_proxy_group, ext, nullptr);
+}
+
 std::string proxyToSingBox(std::vector<Proxy> &nodes, const std::string &base_conf, std::vector<RulesetContent> &ruleset_content_array, const ProxyGroupConfigs &extra_proxy_group, extra_settings &ext)
 {
     using namespace rapidjson_ext;
@@ -2980,12 +3257,14 @@ std::string proxyToSingBox(std::vector<Proxy> &nodes, const std::string &base_co
         json.SetObject();
     }
 
-    proxyToSingBox(nodes, json, ruleset_content_array, extra_proxy_group, ext);
+    std::set<std::string> pruned_groups;
+    proxyToSingBoxImpl(nodes, json, ruleset_content_array, extra_proxy_group, ext, &pruned_groups);
 
     if(ext.nodelist || !ext.enable_rule_generator)
         return json | SerializeObject();
 
-    rulesetToSingBox(json, ruleset_content_array, ext.overwrite_original_rules);
+    std::vector<RulesetContent> active_rulesets = filterPrunedRulesets(ruleset_content_array, pruned_groups);
+    rulesetToSingBox(json, active_rulesets, ext.overwrite_original_rules, ext.enable_rule_dedup);
 
     return json | SerializeObject();
 }

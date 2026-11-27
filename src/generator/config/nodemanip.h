@@ -9,6 +9,7 @@
 #include <quickjspp.hpp>
 #endif // NO_JS_RUNTIME
 
+#include "config/region.h"
 #include "config/regmatch.h"
 #include "parser/config/proxy.h"
 #include "utils/map_extra.h"
@@ -25,6 +26,10 @@ struct parse_settings
     bool authorized = false;
     string_icase_map *request_header = nullptr;
     std::string *custom_user_agent = nullptr;
+    std::string *custom_referer = nullptr;
+    const RegionPresetMap *region_presets = nullptr;
+    const std::string *prefetched_sub = nullptr;
+    const std::string *prefetched_headers = nullptr;
 #ifndef NO_JS_RUNTIME
     qjs::Runtime *js_runtime = nullptr;
     qjs::Context *js_context = nullptr;
@@ -32,8 +37,8 @@ struct parse_settings
 };
 
 int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID, parse_settings &parse_set);
-void filterNodes(std::vector<Proxy> &nodes, string_array &exclude_remarks, string_array &include_remarks, int groupID);
-bool applyMatcher(const std::string &rule, std::string &real_rule, const Proxy &node);
+void filterNodes(std::vector<Proxy> &nodes, string_array &exclude_remarks, string_array &include_remarks, int groupID, const RegionPresetMap *region_presets = nullptr);
+bool applyMatcher(const std::string &rule, std::string &real_rule, const Proxy &node, const RegionPresetMap *region_presets = nullptr);
 void preprocessNodes(std::vector<Proxy> &nodes, extra_settings &ext);
 
 #endif // NODEMANIP_H_INCLUDED

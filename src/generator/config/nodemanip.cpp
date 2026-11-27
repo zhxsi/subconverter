@@ -20,8 +20,6 @@
 
 extern Settings global;
 
-bool applyMatcher(const std::string &rule, std::string &real_rule, const Proxy &node);
-
 int explodeConf(const std::string &filepath, std::vector<Proxy> &nodes)
 {
     return explodeConfContent(fileGet(filepath), nodes);
@@ -52,41 +50,38 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID, parse_
     link = replaceAllDistinct(link, "\"", "");
 
     /// script:filepath,arg1,arg2,...
-    if(authorized) script_safe_runner(parse_set.js_runtime, parse_set.js_context, [&](qjs::Context &ctx)
+    if(authorized && startsWith(link, "script:")) script_safe_runner(parse_set.js_runtime, parse_set.js_context, [&](qjs::Context &ctx)
     {
-        if(startsWith(link, "script:")) /// process subscription with script
+        writeLog(0, "Found script link. Start running...", LOG_LEVEL_INFO);
+        string_array args = split(link.substr(7), ",");
+        if(args.size() >= 1)
         {
-            writeLog(0, "Found script link. Start running...", LOG_LEVEL_INFO);
-            string_array args = split(link.substr(7), ",");
-            if(args.size() >= 1)
+            std::string script = fileGet(args[0], false);
+            try
             {
-                std::string script = fileGet(args[0], false);
-                try
+                ctx.eval(script);
+                args.erase(args.begin()); /// remove script path
+                auto parse = (std::function<std::string(const std::string&, const string_array&)>) ctx.eval("parse");
+                switch(args.size())
                 {
-                    ctx.eval(script);
-                    args.erase(args.begin()); /// remove script path
-                    auto parse = (std::function<std::string(const std::string&, const string_array&)>) ctx.eval("parse");
-                    switch(args.size())
+                case 0:
+                    link = parse("", string_array());
+                    break;
+                case 1:
+                    link = parse(args[0], string_array());
+                    break;
+                default:
                     {
-                    case 0:
-                        link = parse("", string_array());
+                        std::string first = args[0];
+                        args.erase(args.begin());
+                        link = parse(first, args);
                         break;
-                    case 1:
-                        link = parse(args[0], string_array());
-                        break;
-                    default:
-                        {
-                            std::string first = args[0];
-                            args.erase(args.begin());
-                            link = parse(first, args);
-                            break;
-                        }
                     }
                 }
-                catch(qjs::exception)
-                {
-                    script_print_stack(ctx);
-                }
+            }
+            catch(qjs::exception)
+            {
+                script_print_stack(ctx);
             }
         }
     }, global.scriptCleanContext);
@@ -152,8 +147,31 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID, parse_
         {
             custom_headers["User-Agent"] = *parse_set.custom_user_agent;
         }
+
+        if(parse_set.custom_referer && !parse_set.custom_referer->empty())
+        {
+            std::string referer = trim(*parse_set.custom_referer);
+            std::string referer_mode = toLower(referer);
+            if(referer_mode == "none" || referer_mode == "off" || referer_mode == "false" || referer_mode == "disable" || referer_mode == "disabled")
+            {
+                custom_headers.erase("Referer");
+            }
+            else if(referer_mode != "pass" && referer_mode != "passthrough" && referer_mode != "inherit" && referer_mode != "true")
+            {
+                custom_headers["Referer"] = referer;
+            }
+        }
         
-        strSub = webGet(link, proxy, global.cacheSubscription, &extra_headers, &custom_headers);
+        if(parse_set.prefetched_sub)
+        {
+            strSub = *parse_set.prefetched_sub;
+            if(parse_set.prefetched_headers)
+                extra_headers = *parse_set.prefetched_headers;
+        }
+        else
+        {
+            strSub = webGet(link, proxy, global.cacheSubscription, &extra_headers, &custom_headers);
+        }
         /*
         if(strSub.size() == 0)
         {
@@ -191,7 +209,7 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID, parse_
                 if(custom_group.size())
                     x.Group = custom_group;
             }
-            filterNodes(nodes, exclude_remarks, include_remarks, groupID);
+            filterNodes(nodes, exclude_remarks, include_remarks, groupID, parse_set.region_presets);
             copyNodes(nodes, allNodes);
         }
         else
@@ -223,7 +241,7 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID, parse_
             if(!custom_group.empty())
                 x.Group = custom_group;
         }
-        filterNodes(nodes, exclude_remarks, include_remarks, groupID);
+        filterNodes(nodes, exclude_remarks, include_remarks, groupID, parse_set.region_presets);
         copyNodes(nodes, allNodes);
         break;
     default:
@@ -241,16 +259,16 @@ int addNodes(std::string link, std::vector<Proxy> &allNodes, int groupID, parse_
     return 0;
 }
 
-bool chkIgnore(const Proxy &node, string_array &exclude_remarks, string_array &include_remarks)
+bool chkIgnore(const Proxy &node, string_array &exclude_remarks, string_array &include_remarks, const RegionPresetMap *region_presets)
 {
     bool excluded = false, included = false;
     //std::string remarks = UTF8ToACP(node.remarks);
     //std::string remarks = node.remarks;
     //writeLog(LOG_TYPE_INFO, "Comparing exclude remarks...");
-    excluded = std::any_of(exclude_remarks.cbegin(), exclude_remarks.cend(), [&node](const auto &x)
+    excluded = std::any_of(exclude_remarks.cbegin(), exclude_remarks.cend(), [&node, region_presets](const auto &x)
     {
         std::string real_rule;
-        if(applyMatcher(x, real_rule, node))
+        if(applyMatcher(x, real_rule, node, region_presets))
         {
             if(real_rule.empty()) return true;
             return regFind(node.Remark, real_rule);
@@ -261,10 +279,10 @@ bool chkIgnore(const Proxy &node, string_array &exclude_remarks, string_array &i
     if(include_remarks.size() != 0)
     {
         //writeLog(LOG_TYPE_INFO, "Comparing include remarks...");
-        included = std::any_of(include_remarks.cbegin(), include_remarks.cend(), [&node](const auto &x)
+        included = std::any_of(include_remarks.cbegin(), include_remarks.cend(), [&node, region_presets](const auto &x)
         {
             std::string real_rule;
-            if(applyMatcher(x, real_rule, node))
+            if(applyMatcher(x, real_rule, node, region_presets))
             {
                 if(real_rule.empty()) return true;
                 return regFind(node.Remark, real_rule);
@@ -281,13 +299,13 @@ bool chkIgnore(const Proxy &node, string_array &exclude_remarks, string_array &i
     return excluded || !included;
 }
 
-void filterNodes(std::vector<Proxy> &nodes, string_array &exclude_remarks, string_array &include_remarks, int groupID)
+void filterNodes(std::vector<Proxy> &nodes, string_array &exclude_remarks, string_array &include_remarks, int groupID, const RegionPresetMap *region_presets)
 {
     int node_index = 0;
     std::vector<Proxy>::iterator iter = nodes.begin();
     while(iter != nodes.end())
     {
-        if(chkIgnore(*iter, exclude_remarks, include_remarks))
+        if(chkIgnore(*iter, exclude_remarks, include_remarks, region_presets))
         {
             writeLog(LOG_TYPE_INFO, "Node  " + iter->Group + " - " + iter->Remark + "  has been ignored and will not be added.");
             nodes.erase(iter);
@@ -413,7 +431,7 @@ void nodeRename(Proxy &node, const RegexMatchConfigs &rename_array, extra_settin
             }, global.scriptCleanContext);
             continue;
         }
-        if(applyMatcher(x.Match, real_rule, node) && real_rule.size())
+        if(applyMatcher(x.Match, real_rule, node, &ext.region_presets) && real_rule.size())
             remark = regReplace(remark, real_rule, x.Replace);
     }
     if(remark.empty())
@@ -470,7 +488,7 @@ std::string addEmoji(const Proxy &node, const RegexMatchConfigs &emoji_array, ex
         }
         if(x.Replace.empty())
             continue;
-        if(applyMatcher(x.Match, real_rule, node) && real_rule.size() && regFind(node.Remark, real_rule))
+        if(!x.Match.empty() && applyMatcher(x.Match, real_rule, node, &ext.region_presets) && (real_rule.empty() || regFind(node.Remark, real_rule)))
             return x.Replace + " " + node.Remark;
     }
     return node.Remark;

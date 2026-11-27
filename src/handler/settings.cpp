@@ -26,24 +26,42 @@ int importItems(string_array &target, bool scope_limit)
 {
     string_array result;
     std::stringstream ss;
-    std::string path, content, strLine;
+    std::string strLine;
     unsigned int itemCount = 0;
-    for(std::string &x : target)
+    std::string proxy;
+
+    std::map<std::string, std::shared_future<std::string>> pending_fetches;
+    std::vector<std::string> import_paths(target.size());
+    for(size_t i = 0; i < target.size(); ++i)
     {
-        if(x.find("!!import:") == std::string::npos)
+        if(target[i].find("!!import:") == std::string::npos)
+            continue;
+        std::string path = target[i].substr(target[i].find(":") + 1);
+        writeLog(0, "Trying to import items from " + path);
+        import_paths[i] = path;
+        if(!fileExist(path) && isLink(path) && !pending_fetches.count(path))
         {
-            result.emplace_back(x);
+            if(proxy.empty())
+                proxy = parseProxy(global.proxyConfig);
+            pending_fetches.emplace(path, submitFetchTask([path, proxy]() {
+                return webGet(path, proxy, global.cacheConfig);
+            }).share());
+        }
+    }
+
+    for(size_t i = 0; i < target.size(); ++i)
+    {
+        if(import_paths[i].empty())
+        {
+            result.emplace_back(target[i]);
             continue;
         }
-        path = x.substr(x.find(":") + 1);
-        writeLog(0, "Trying to import items from " + path);
-
-        std::string proxy = parseProxy(global.proxyConfig);
-
+        const std::string &path = import_paths[i];
+        std::string content;
         if(fileExist(path))
             content = fileGet(path, scope_limit);
-        else if(isLink(path))
-            content = webGet(path, proxy, global.cacheConfig);
+        else if(auto iter = pending_fetches.find(path); iter != pending_fetches.end())
+            content = iter->second.get();
         else
             writeLog(0, "File not found or not a valid URL: " + path, LOG_LEVEL_ERROR);
         if(content.empty())
@@ -77,36 +95,52 @@ toml::value parseToml(const std::string &content, const std::string &fname)
 
 void importItems(std::vector<toml::value> &root, const std::string &import_key, bool scope_limit = true)
 {
-    std::string content;
     std::vector<toml::value> newRoot;
-    auto iter = root.begin();
     size_t count = 0;
+    std::string proxy;
 
-    std::string proxy = parseProxy(global.proxyConfig);
-    while(iter != root.end())
+    std::map<std::string, std::shared_future<std::string>> pending_fetches;
+    std::vector<std::string> import_paths(root.size());
+    for(size_t i = 0; i < root.size(); ++i)
     {
-        auto& table = iter->as_table();
+        auto &table = root[i].as_table();
         if(table.find("import") == table.end())
-            newRoot.emplace_back(std::move(*iter));
-        else
+            continue;
+        const std::string &path = toml::get<std::string>(table.at("import"));
+        writeLog(0, "Trying to import items from " + path);
+        import_paths[i] = path;
+        if(!fileExist(path) && isLink(path) && !pending_fetches.count(path))
         {
-            const std::string &path = toml::get<std::string>(table.at("import"));
-            writeLog(0, "Trying to import items from " + path);
-            if(fileExist(path))
-                content = fileGet(path, scope_limit);
-            else if(isLink(path))
-                content = webGet(path, proxy, global.cacheConfig);
-            else
-                writeLog(0, "File not found or not a valid URL: " + path, LOG_LEVEL_ERROR);
-            if(!content.empty())
-            {
-                auto items = parseToml(content, path);
-                auto list = toml::find<std::vector<toml::value>>(items, import_key);
-                count += list.size();
-                std::move(list.begin(), list.end(), std::back_inserter(newRoot));
-            }
+            if(proxy.empty())
+                proxy = parseProxy(global.proxyConfig);
+            pending_fetches.emplace(path, submitFetchTask([path, proxy]() {
+                return webGet(path, proxy, global.cacheConfig);
+            }).share());
         }
-        iter++;
+    }
+
+    for(size_t i = 0; i < root.size(); ++i)
+    {
+        if(import_paths[i].empty())
+        {
+            newRoot.emplace_back(std::move(root[i]));
+            continue;
+        }
+        const std::string &path = import_paths[i];
+        std::string content;
+        if(fileExist(path))
+            content = fileGet(path, scope_limit);
+        else if(auto iter = pending_fetches.find(path); iter != pending_fetches.end())
+            content = iter->second.get();
+        else
+            writeLog(0, "File not found or not a valid URL: " + path, LOG_LEVEL_ERROR);
+        if(!content.empty())
+        {
+            auto items = parseToml(content, path);
+            auto list = toml::find<std::vector<toml::value>>(items, import_key);
+            count += list.size();
+            std::move(list.begin(), list.end(), std::back_inserter(newRoot));
+        }
     }
     root.swap(newRoot);
     writeLog(0, "Imported " + std::to_string(count) + " item(s).");
@@ -245,6 +279,139 @@ void readRuleset(YAML::Node node, string_array &dest, bool scope_limit = true)
     importItems(dest, scope_limit);
 }
 
+static void readYAMLRegionRules(YAML::Node node, RegionRuleConfigs &dest, bool is_append, bool scope_limit = true)
+{
+    if(!node.IsDefined() || node.IsNull())
+        return;
+    if(node.IsMap())
+    {
+        for(auto iter = node.begin(); iter != node.end(); ++iter)
+        {
+            std::string name = trim(safe_as<std::string>(iter->first));
+            std::string pattern = trim(safe_as<std::string>(iter->second));
+            if(!name.empty() && !pattern.empty())
+                dest.push_back(RegionRule{std::move(name), std::move(pattern), is_append, true});
+        }
+        return;
+    }
+    if(node.IsSequence())
+    {
+        string_array raw_items;
+        for(auto &&object : node)
+        {
+            if(object.IsScalar())
+            {
+                std::string line = safe_as<std::string>(object);
+                if(!line.empty())
+                    raw_items.emplace_back(std::move(line));
+            }
+            else if(object.IsMap())
+            {
+                std::string imp, name, pattern;
+                object["import"] >>= imp;
+                if(!imp.empty())
+                {
+                    raw_items.emplace_back("!!import:" + imp);
+                    continue;
+                }
+                object["name"] >>= name;
+                object["pattern"] >>= pattern;
+                if(pattern.empty())
+                    object["match"] >>= pattern;
+                if(!name.empty() && !pattern.empty())
+                    dest.push_back(RegionRule{trim(name), trim(pattern), is_append, true});
+            }
+        }
+        if(!raw_items.empty())
+        {
+            importItems(raw_items, scope_limit);
+            auto parsed = parseRegionRulesFromIni(raw_items, is_append);
+            dest.insert(dest.end(), std::make_move_iterator(parsed.begin()), std::make_move_iterator(parsed.end()));
+        }
+    }
+}
+
+static void readTOMLRegionRules(const toml::value &section, const std::string &key, RegionRuleConfigs &dest, bool is_append, bool scope_limit = true)
+{
+    if(!section.is_table() || !section.contains(key))
+        return;
+    const auto &val = section.at(key);
+    if(val.is_table())
+    {
+        for(const auto &kv : val.as_table())
+        {
+            if(kv.second.is_string())
+            {
+                std::string name = trim(kv.first);
+                std::string pattern = trim(kv.second.as_string());
+                if(!name.empty() && !pattern.empty())
+                    dest.push_back(RegionRule{std::move(name), std::move(pattern), is_append, true});
+            }
+        }
+        return;
+    }
+    if(val.is_array())
+    {
+        string_array raw_items;
+        for(const auto &item : val.as_array())
+        {
+            if(item.is_string())
+            {
+                raw_items.emplace_back(item.as_string());
+            }
+            else if(item.is_table())
+            {
+                std::string imp = toml::find_or<std::string>(item, "import", "");
+                if(!imp.empty())
+                {
+                    raw_items.emplace_back("!!import:" + imp);
+                    continue;
+                }
+                std::string name = trim(toml::find_or<std::string>(item, "name", ""));
+                std::string pattern = trim(toml::find_or<std::string>(item, "pattern", ""));
+                if(pattern.empty())
+                    pattern = trim(toml::find_or<std::string>(item, "match", ""));
+                if(!name.empty() && !pattern.empty())
+                    dest.push_back(RegionRule{std::move(name), std::move(pattern), is_append, true});
+            }
+        }
+        if(!raw_items.empty())
+        {
+            importItems(raw_items, scope_limit);
+            auto parsed = parseRegionRulesFromIni(raw_items, is_append);
+            dest.insert(dest.end(), std::make_move_iterator(parsed.begin()), std::make_move_iterator(parsed.end()));
+        }
+    }
+}
+
+static void readINIRegionRules(INIReader &ini, RegionRuleConfigs &dest, bool scope_limit)
+{
+    string_multimap items;
+    if(ini.get_items(items) != INIREADER_EXCEPTION_NONE)
+        return;
+
+    string_array override_items, append_items;
+    for(const auto &kv : items)
+    {
+        if(kv.first == "region")
+            override_items.emplace_back(kv.second);
+        else if(kv.first == "region_append")
+            append_items.emplace_back(kv.second);
+    }
+    if(!override_items.empty())
+    {
+        importItems(override_items, scope_limit);
+        auto parsed = parseRegionRulesFromIni(override_items, false);
+        dest.insert(dest.end(), std::make_move_iterator(parsed.begin()), std::make_move_iterator(parsed.end()));
+    }
+    if(!append_items.empty())
+    {
+        importItems(append_items, scope_limit);
+        auto parsed = parseRegionRulesFromIni(append_items, true);
+        dest.insert(dest.end(), std::make_move_iterator(parsed.begin()), std::make_move_iterator(parsed.end()));
+    }
+}
+
 void refreshRulesets(RulesetConfigs &ruleset_list, std::vector<RulesetContent> &ruleset_content_array)
 {
     eraseElements(ruleset_content_array);
@@ -252,6 +419,7 @@ void refreshRulesets(RulesetConfigs &ruleset_list, std::vector<RulesetContent> &
     RulesetContent rc;
 
     std::string proxy = parseProxy(global.proxyRuleset);
+    std::map<std::string, std::shared_future<std::string>> in_batch;
 
     for(RulesetConfig &x : ruleset_list)
     {
@@ -261,7 +429,7 @@ void refreshRulesets(RulesetConfigs &ruleset_list, std::vector<RulesetContent> &
         if(pos != std::string::npos)
         {
             writeLog(0, "Adding rule '" + rule_url.substr(pos + 2) + "," + rule_group + "'.", LOG_LEVEL_INFO);
-            rc = {rule_group, "", "", RULESET_SURGE, std::async(std::launch::async, [=](){return rule_url.substr(pos);}), 0};
+            rc = {rule_group, "", "", RULESET_SURGE, makeReadyFuture(rule_url.substr(pos)), 0};
         }
         else
         {
@@ -274,7 +442,18 @@ void refreshRulesets(RulesetConfigs &ruleset_list, std::vector<RulesetContent> &
                 type = iter->second;
             }
             writeLog(0, "Updating ruleset url '" + rule_url + "' with group '" + rule_group + "'.", LOG_LEVEL_INFO);
-            rc = {rule_group, rule_url, rule_url_typed, type, fetchFileAsync(rule_url, proxy, global.cacheRuleset, true, global.asyncFetchRuleset), x.Interval};
+            std::shared_future<std::string> content_future;
+            auto cached_iter = in_batch.find(rule_url);
+            if(cached_iter != in_batch.end())
+            {
+                content_future = cached_iter->second;
+            }
+            else
+            {
+                content_future = fetchFileAsync(rule_url, proxy, global.cacheRuleset, true, global.asyncFetchRuleset);
+                in_batch.emplace(rule_url, content_future);
+            }
+            rc = {rule_group, rule_url, rule_url_typed, type, std::move(content_future), x.Interval};
         }
         ruleset_content_array.emplace_back(std::move(rc));
     }
@@ -432,6 +611,7 @@ void readYAMLConf(YAML::Node &node)
         else
         {
             section["overwrite_original_rules"] >> global.overwriteOriginalRules;
+            section["enable_rule_dedup"] >> global.enableRuleDedup;
             section["update_ruleset_on_request"] >> global.updateRulesetOnRequest;
         }
         const char *ruleset_title = section["rulesets"].IsDefined() ? "rulesets" : "surge_ruleset";
@@ -444,11 +624,27 @@ void readYAMLConf(YAML::Node &node)
     }
 
     const char *groups_title = node["proxy_groups"].IsDefined() ? "proxy_groups" : "proxy_group";
-    if(node[groups_title].IsDefined() && node[groups_title]["custom_proxy_group"].IsDefined())
+    if(node[groups_title].IsDefined())
     {
-        string_array vArray;
-        readGroup(node[groups_title]["custom_proxy_group"], vArray, false);
-        global.customProxyGroups = INIBinding::from<ProxyGroupConfig>::from_ini(vArray);
+        node[groups_title]["prune_empty_groups"] >> global.pruneEmptyGroups;
+        if(node[groups_title]["custom_proxy_group"].IsDefined())
+        {
+            string_array vArray;
+            readGroup(node[groups_title]["custom_proxy_group"], vArray, false);
+            global.customProxyGroups = INIBinding::from<ProxyGroupConfig>::from_ini(vArray);
+        }
+    }
+
+    eraseElements(global.regionRules);
+    if(node["regions"].IsDefined())
+    {
+        readYAMLRegionRules(node["regions"]["region"], global.regionRules, false, false);
+        readYAMLRegionRules(node["regions"]["region_append"], global.regionRules, true, false);
+    }
+    if(node["node_pref"].IsDefined())
+    {
+        readYAMLRegionRules(node["node_pref"]["region"], global.regionRules, false, false);
+        readYAMLRegionRules(node["node_pref"]["region_append"], global.regionRules, true, false);
     }
 
     if(node["template"].IsDefined())
@@ -561,7 +757,6 @@ void readYAMLConf(YAML::Node &node)
         }
         node["advanced"]["script_clean_context"] >> global.scriptCleanContext;
         node["advanced"]["async_fetch_ruleset"] >> global.asyncFetchRuleset;
-        node["advanced"]["skip_failed_links"] >> global.skipFailedLinks;
     }
     writeLog(0, "Load preference settings in YAML format completed.", LOG_LEVEL_INFO);
 }
@@ -640,12 +835,23 @@ void readTOMLConf(toml::value &root)
                   "clash_use_new_field_name", global.clashUseNewField,
                   "clash_proxies_style", global.clashProxiesStyle,
                   "clash_proxy_groups_style", global.clashProxyGroupsStyle,
-                  "singbox_add_clash_modes", global.singBoxAddClashModes
+                  "singbox_add_clash_modes", global.singBoxAddClashModes,
+                  "prune_empty_groups", global.pruneEmptyGroups
     );
 
     auto renameconfs = toml::find_or<std::vector<toml::value>>(section_node_pref, "rename_node", {});
     importItems(renameconfs, "rename_node", false);
     safe_set_renames(toml::get<RegexMatchConfigs>(toml::value(renameconfs)));
+
+    eraseElements(global.regionRules);
+    readTOMLRegionRules(section_node_pref, "region", global.regionRules, false, false);
+    readTOMLRegionRules(section_node_pref, "region_append", global.regionRules, true, false);
+    if(root.contains("regions"))
+    {
+        auto section_regions = toml::find(root, "regions");
+        readTOMLRegionRules(section_regions, "region", global.regionRules, false, false);
+        readTOMLRegionRules(section_regions, "region_append", global.regionRules, true, false);
+    }
 
     auto section_managed = toml::find(root, "managed_config");
 
@@ -683,6 +889,7 @@ void readTOMLConf(toml::value &root)
     find_if_exist(section_ruleset,
                   "enabled", global.enableRuleGen,
                   "overwrite_original_rules", global.overwriteOriginalRules,
+                  "enable_rule_dedup", global.enableRuleDedup,
                   "update_ruleset_on_request", global.updateRulesetOnRequest
     );
 
@@ -739,8 +946,7 @@ void readTOMLConf(toml::value &root)
                   "cache_config", cache_config,
                   "cache_ruleset", cache_ruleset,
                   "script_clean_context", global.scriptCleanContext,
-                  "async_fetch_ruleset", global.asyncFetchRuleset,
-                  "skip_failed_links", global.skipFailedLinks
+                  "async_fetch_ruleset", global.asyncFetchRuleset
     );
 
     if(global.printDbgInfo)
@@ -945,6 +1151,7 @@ void readConf()
     if(global.enableRuleGen)
     {
         ini.get_bool_if_exist("overwrite_original_rules", global.overwriteOriginalRules);
+        ini.get_bool_if_exist("enable_rule_dedup", global.enableRuleDedup);
         ini.get_bool_if_exist("update_ruleset_on_request", global.updateRulesetOnRequest);
         if(ini.item_prefix_exist("ruleset"))
         {
@@ -971,12 +1178,22 @@ void readConf()
         ini.enter_section("proxy_groups");
     else
         ini.enter_section("clash_proxy_group");
+    ini.get_bool_if_exist("prune_empty_groups", global.pruneEmptyGroups);
     if(ini.item_prefix_exist("custom_proxy_group"))
     {
         string_array vArray;
         ini.get_all("custom_proxy_group", vArray);
         importItems(vArray, false);
         global.customProxyGroups = INIBinding::from<ProxyGroupConfig>::from_ini(vArray);
+    }
+
+    eraseElements(global.regionRules);
+    for(const char *sec : {"node_pref", "regions"})
+    {
+        if(!ini.section_exist(sec))
+            continue;
+        ini.enter_section(sec);
+        readINIRegionRules(ini, global.regionRules, false);
     }
 
     ini.enter_section("template");
@@ -1069,7 +1286,6 @@ void readConf()
     }
     ini.get_bool_if_exist("script_clean_context", global.scriptCleanContext);
     ini.get_bool_if_exist("async_fetch_ruleset", global.asyncFetchRuleset);
-    ini.get_bool_if_exist("skip_failed_links", global.skipFailedLinks);
 
     writeLog(0, "Load preference settings in INI format completed.", LOG_LEVEL_INFO);
 }
@@ -1092,6 +1308,8 @@ int loadExternalYAML(YAML::Node &node, ExternalConfig &ext)
 
     section["enable_rule_generator"] >> ext.enable_rule_generator;
     section["overwrite_original_rules"] >> ext.overwrite_original_rules;
+    section["enable_rule_dedup"] >> ext.enable_rule_dedup;
+    section["prune_empty_groups"] >> ext.prune_empty_groups;
 
     const char *group_name = section["proxy_groups"].IsDefined() ? "proxy_groups" : "custom_proxy_group";
     if(section[group_name].size())
@@ -1133,6 +1351,8 @@ int loadExternalYAML(YAML::Node &node, ExternalConfig &ext)
 
     section["include_remarks"] >> ext.include;
     section["exclude_remarks"] >> ext.exclude;
+    readYAMLRegionRules(section["region"], ext.region_rules, false, global.APIMode);
+    readYAMLRegionRules(section["region_append"], ext.region_rules, true, global.APIMode);
 
     if(node["template_args"].IsSequence() && ext.tpl_args != NULL)
     {
@@ -1155,6 +1375,8 @@ int loadExternalTOML(toml::value &root, ExternalConfig &ext)
     find_if_exist(section,
                   "enable_rule_generator", ext.enable_rule_generator,
                   "overwrite_original_rules", ext.overwrite_original_rules,
+                  "enable_rule_dedup", ext.enable_rule_dedup,
+                  "prune_empty_groups", ext.prune_empty_groups,
                   "clash_rule_base", ext.clash_rule_base,
                   "surge_rule_base", ext.surge_rule_base,
                   "surfboard_rule_base", ext.surfboard_rule_base,
@@ -1198,13 +1420,16 @@ int loadExternalTOML(toml::value &root, ExternalConfig &ext)
     importItems(renameconfs, "rename_node", false);
     ext.rename = toml::get<RegexMatchConfigs>(toml::value(renameconfs));
 
+    readTOMLRegionRules(section, "region", ext.region_rules, false, global.APIMode);
+    readTOMLRegionRules(section, "region_append", ext.region_rules, true, global.APIMode);
+
     return 0;
 }
 
 int loadExternalConfig(std::string &path, ExternalConfig &ext)
 {
     std::string base_content, proxy = parseProxy(global.proxyConfig), config = fetchFile(path, proxy, global.cacheConfig);
-    if(render_template(config, *ext.tpl_args, base_content, global.templatePath) != 0)
+    if(ext.tpl_args == nullptr || render_template(config, *ext.tpl_args, base_content, global.templatePath) != 0)
         base_content = config;
 
     try
@@ -1268,6 +1493,8 @@ int loadExternalConfig(std::string &path, ExternalConfig &ext)
     ini.get_if_exist("singbox_rule_base", ext.singbox_rule_base);
 
     ini.get_bool_if_exist("overwrite_original_rules", ext.overwrite_original_rules);
+    ini.get_bool_if_exist("enable_rule_dedup", ext.enable_rule_dedup);
+    ini.get_bool_if_exist("prune_empty_groups", ext.prune_empty_groups);
     ini.get_bool_if_exist("enable_rule_generator", ext.enable_rule_generator);
 
     if(ini.item_prefix_exist("rename"))
@@ -1290,6 +1517,7 @@ int loadExternalConfig(std::string &path, ExternalConfig &ext)
         ini.get_all("include_remarks", ext.include);
     if(ini.item_prefix_exist("exclude_remarks"))
         ini.get_all("exclude_remarks", ext.exclude);
+    readINIRegionRules(ini, ext.region_rules, global.APIMode);
 
     if(ini.section_exist("template") && ext.tpl_args != nullptr)
     {

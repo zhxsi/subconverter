@@ -299,6 +299,48 @@ void checkExternalBase(const std::string &path, std::string &dest)
         dest = path;
 }
 
+struct PrefetchedSub
+{
+    std::string content;
+    std::string headers;
+};
+
+static string_icase_map buildSubRequestHeaders(const string_icase_map &request_headers, const std::string &custom_user_agent, const std::string &custom_referer)
+{
+    string_icase_map custom_headers = request_headers;
+    if(!custom_user_agent.empty())
+        custom_headers["User-Agent"] = custom_user_agent;
+    if(!custom_referer.empty())
+    {
+        std::string referer = trim(custom_referer);
+        std::string referer_mode = toLower(referer);
+        if(referer_mode == "none" || referer_mode == "off" || referer_mode == "false" || referer_mode == "disable" || referer_mode == "disabled")
+            custom_headers.erase("Referer");
+        else if(referer_mode != "pass" && referer_mode != "passthrough" && referer_mode != "inherit" && referer_mode != "true")
+            custom_headers["Referer"] = referer;
+    }
+    return custom_headers;
+}
+
+static std::string extractPrefetchSubUrl(std::string link)
+{
+    link = regTrim(replaceAllDistinct(link, "\"", ""));
+    if(link.empty() || startsWith(link, "script:") || link.find("!!import:") != std::string::npos)
+        return "";
+    if(startsWith(link, "tag:"))
+    {
+        string_size pos = link.find(",");
+        if(pos != std::string::npos)
+            link.erase(0, pos + 1);
+    }
+    if(startsWith(link, "https://t.me/socks") || startsWith(link, "tg://socks")
+       || startsWith(link, "https://t.me/http") || startsWith(link, "tg://http"))
+        return "";
+    if(startsWith(link, "surge:///install-config"))
+        link = urlDecode(getUrlArg(link, "url"));
+    return isLink(link) ? link : "";
+}
+
 std::string subconverter(RESPONSE_CALLBACK_ARGS)
 {
     auto &argument = request.argument;
@@ -334,7 +376,10 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     std::string argCustomGroups = urlSafeBase64Decode(getUrlArg(argument, "groups")), argCustomRulesets = urlSafeBase64Decode(getUrlArg(argument, "ruleset")), argExternalConfig = getUrlArg(argument, "config");
     std::string argDeviceID = getUrlArg(argument, "dev_id"), argFilename = getUrlArg(argument, "filename"), argUpdateInterval = getUrlArg(argument, "interval"), argUpdateStrict = getUrlArg(argument, "strict");
     std::string argRenames = getUrlArg(argument, "rename"), argFilterScript = getUrlArg(argument, "filter_script");
-    std::string argUserAgent = getUrlArg(argument, "ua");
+    std::string argUserAgent = urlDecode(getUrlArg(argument, "ua"));
+    std::string argReferer = urlDecode(getUrlArg(argument, "referer"));
+    std::string argRegion = urlDecode(getUrlArg(argument, "region"));
+    std::string argRegionAppend = urlDecode(getUrlArg(argument, "region_append"));
 
     /// switches with default value
     tribool argUpload = getUrlArg(argument, "upload"), argEmoji = getUrlArg(argument, "emoji"), argAddEmoji = getUrlArg(argument, "add_emoji"), argRemoveEmoji = getUrlArg(argument, "remove_emoji");
@@ -438,8 +483,35 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     ext.quanx_dev_id = !argDeviceID.empty() ? argDeviceID : global.quanXDevID;
     ext.enable_rule_generator = global.enableRuleGen;
     ext.overwrite_original_rules = global.overwriteOriginalRules;
+    ext.enable_rule_dedup = global.enableRuleDedup;
+    ext.prune_empty_groups = global.pruneEmptyGroups;
+    applyRegionRules(ext.region_presets, global.regionRules);
     if(!argExpandRulesets)
         ext.managed_config_prefix = global.managedConfigPrefix;
+
+    /// kick off remote subscription downloads immediately so they overlap with
+    /// external config loading, ruleset fetching, and base template fetching
+    std::map<std::string, std::shared_future<PrefetchedSub>> prefetched_subs;
+    string_icase_map prefetch_headers = buildSubRequestHeaders(request.headers, argUserAgent, argReferer);
+    auto kickoff_prefetch = [&](const std::string &raw_list)
+    {
+        if(raw_list.empty())
+            return;
+        for(const std::string &item : split(raw_list, "|"))
+        {
+            std::string sub_url = extractPrefetchSubUrl(item);
+            if(sub_url.empty() || prefetched_subs.count(sub_url))
+                continue;
+            prefetched_subs.emplace(sub_url, submitFetchTask([sub_url, proxy, prefetch_headers]() mutable {
+                PrefetchedSub out;
+                out.content = webGet(sub_url, proxy, global.cacheSubscription, &out.headers, &prefetch_headers);
+                return out;
+            }).share());
+        }
+    };
+    if(!global.insertUrls.empty() && argEnableInsert)
+        kickoff_prefetch(global.insertUrls);
+    kickoff_prefetch(argUrl);
 
     /// load external configuration
     if(argExternalConfig.empty())
@@ -450,6 +522,10 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         writeLog(0, "External configuration file provided. Loading...", LOG_LEVEL_INFO);
         ExternalConfig extconf;
         extconf.tpl_args = &tpl_args;
+        // An external configuration only overrides the global value when it
+        // explicitly provides enable_rule_dedup / prune_empty_groups.
+        extconf.enable_rule_dedup = ext.enable_rule_dedup;
+        extconf.prune_empty_groups = ext.prune_empty_groups;
         if(loadExternalConfig(argExternalConfig, extconf) == 0)
         {
             if(!ext.nodelist)
@@ -472,6 +548,8 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
                         lCustomProxyGroups = extconf.custom_proxy_group;
                     ext.enable_rule_generator = extconf.enable_rule_generator;
                     ext.overwrite_original_rules = extconf.overwrite_original_rules;
+                    ext.enable_rule_dedup = extconf.enable_rule_dedup;
+                    ext.prune_empty_groups = extconf.prune_empty_groups;
                 }
             }
             if(!extconf.rename.empty())
@@ -482,6 +560,8 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
                 lIncludeRemarks = extconf.include;
             if(!extconf.exclude.empty())
                 lExcludeRemarks = extconf.exclude;
+            if(!extconf.region_rules.empty())
+                applyRegionRules(ext.region_presets, extconf.region_rules);
             argAddEmoji.define(extconf.add_emoji);
             argRemoveEmoji.define(extconf.remove_old_emoji);
         }
@@ -505,16 +585,44 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
             }
         }
     }
-    if(ext.enable_rule_generator && !ext.nodelist && !lSimpleSubscription)
+    if(ext.enable_rule_generator && !ext.nodelist && !lSimpleSubscription && request.method != "HEAD")
     {
         if(lCustomRulesets != global.customRulesets)
             refreshRulesets(lCustomRulesets, lRulesetContent);
         else
         {
             if(global.updateRulesetOnRequest)
-                refreshRulesets(global.customRulesets, global.rulesetsContent);
-            lRulesetContent = global.rulesetsContent;
+            {
+                refreshRulesets(lCustomRulesets, lRulesetContent);
+                safe_set_rulesets(lRulesetContent);
+            }
+            else
+            {
+                lRulesetContent = safe_get_rulesets();
+            }
         }
+    }
+
+    // Kick off target base template fetch concurrently with subscription & ruleset downloads.
+    std::shared_future<std::string> base_template_future;
+    if(!ext.nodelist && request.method != "HEAD")
+    {
+        std::string target_base_path;
+        switch(hash_(argTarget))
+        {
+        case "clash"_hash: case "clashr"_hash: target_base_path = lClashBase; break;
+        case "surge"_hash: target_base_path = lSurgeBase; break;
+        case "surfboard"_hash: target_base_path = lSurfboardBase; break;
+        case "mellow"_hash: target_base_path = lMellowBase; break;
+        case "sssub"_hash: target_base_path = lSSSubBase; break;
+        case "quan"_hash: target_base_path = lQuanBase; break;
+        case "quanx"_hash: target_base_path = lQuanXBase; break;
+        case "loon"_hash: target_base_path = lLoonBase; break;
+        case "singbox"_hash: target_base_path = lSingBoxBase; break;
+        default: break;
+        }
+        if(!target_base_path.empty())
+            base_template_future = fetchFileAsync(target_base_path, parseProxy(global.proxyConfig), global.cacheConfig, true, true);
     }
 
     if(!argEmoji.is_undef())
@@ -530,6 +638,11 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         ext.rename_array = INIBinding::from<RegexMatchConfig>::from_ini(split(argRenames, "`"), "@");
     else if(ext.rename_array.empty())
         ext.rename_array = safe_get_renames();
+
+    if(!argRegion.empty())
+        applyRegionRules(ext.region_presets, parseRegionRulesFromIni(split(argRegion, "`"), false));
+    if(!argRegionAppend.empty())
+        applyRegionRules(ext.region_presets, parseRegionRulesFromIni(split(argRegionAppend, "`"), true));
 
     /// check custom include/exclude settings
     if (!argIncludeRemark.empty())
@@ -601,6 +714,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     string_array urls;
     std::vector<Proxy> nodes, insert_nodes;
     int groupID = 0;
+    size_t totalLinks = 0, skippedLinks = 0;
 
     parse_settings parse_set;
     parse_set.proxy = &proxy;
@@ -612,9 +726,25 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     parse_set.authorized = authorized;
     parse_set.request_header = &request.headers;
     parse_set.custom_user_agent = &argUserAgent;
+    parse_set.custom_referer = &argReferer;
+    parse_set.region_presets = &ext.region_presets;
     parse_set.js_runtime = ext.js_runtime;
     parse_set.js_context = ext.js_context;
 
+    struct SubFetchTask
+    {
+        std::string url;
+        int group_id = 0;
+        bool is_insert = false;
+    };
+    struct SubFetchResult
+    {
+        int ret = 0;
+        std::vector<Proxy> nodes;
+        std::string sub_info;
+    };
+
+    std::vector<SubFetchTask> fetch_tasks;
     if(!global.insertUrls.empty() && argEnableInsert)
     {
         groupID = -1;
@@ -625,18 +755,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         for(std::string &x : urls)
         {
             x = regTrim(x);
-            writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
-            if(addNodes(x, insert_nodes, groupID, parse_set) == -1)
-            {
-                if(global.skipFailedLinks)
-                    writeLog(0, "The following link doesn't contain any valid node info: " + x, LOG_LEVEL_WARNING);
-                else
-                {
-                    *status_code = 400;
-                    return "The following link doesn't contain any valid node info: " + x;
-                }
-            }
-            groupID--;
+            fetch_tasks.push_back(SubFetchTask{std::move(x), groupID--, true});
         }
     }
     urls = split(argUrl, "|");
@@ -647,25 +766,89 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     for(std::string &x : urls)
     {
         x = regTrim(x);
-        //std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
-        writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
-        if(addNodes(x, nodes, groupID, parse_set) == -1)
+        fetch_tasks.push_back(SubFetchTask{std::move(x), groupID++, false});
+    }
+    totalLinks = fetch_tasks.size();
+
+    auto run_fetch_task = [&](const SubFetchTask &task, bool allow_shared_js) -> SubFetchResult
+    {
+        SubFetchResult res;
+        parse_settings local_parse_set = parse_set;
+        local_parse_set.sub_info = &res.sub_info;
+        if(!allow_shared_js)
         {
-            if(global.skipFailedLinks)
-                writeLog(0, "The following link doesn't contain any valid node info: " + x, LOG_LEVEL_WARNING);
-            else
+            local_parse_set.js_runtime = nullptr;
+            local_parse_set.js_context = nullptr;
+        }
+        PrefetchedSub prefetched;
+        std::string sub_url = extractPrefetchSubUrl(task.url);
+        if(!sub_url.empty())
+        {
+            auto it = prefetched_subs.find(sub_url);
+            if(it != prefetched_subs.end())
             {
-                *status_code = 400;
-                return "The following link doesn't contain any valid node info: " + x;
+                prefetched = it->second.get();
+                local_parse_set.prefetched_sub = &prefetched.content;
+                local_parse_set.prefetched_headers = &prefetched.headers;
             }
         }
-        groupID++;
+        writeLog(0, "Fetching node data from url '" + task.url + "'.", LOG_LEVEL_INFO);
+        res.ret = addNodes(task.url, res.nodes, task.group_id, local_parse_set);
+        return res;
+    };
+
+    std::vector<SubFetchResult> fetch_results(fetch_tasks.size());
+    if(fetch_tasks.size() <= 1)
+    {
+        for(size_t i = 0; i < fetch_tasks.size(); ++i)
+            fetch_results[i] = run_fetch_task(fetch_tasks[i], true);
     }
+    else
+    {
+        std::vector<std::future<SubFetchResult>> futures(fetch_tasks.size());
+        std::vector<bool> is_async(fetch_tasks.size(), false);
+        for(size_t i = 0; i < fetch_tasks.size(); ++i)
+        {
+            bool needs_serial_js = authorized && !global.scriptCleanContext && startsWith(fetch_tasks[i].url, "script:");
+            if(!needs_serial_js)
+            {
+                is_async[i] = true;
+                futures[i] = submitFetchTask([&, i]() { return run_fetch_task(fetch_tasks[i], false); });
+            }
+        }
+        // Run any script: links requiring the shared QuickJS context on the request thread
+        // while all other subscription URLs download concurrently in the worker pool.
+        for(size_t i = 0; i < fetch_tasks.size(); ++i)
+        {
+            if(!is_async[i])
+                fetch_results[i] = run_fetch_task(fetch_tasks[i], true);
+        }
+        for(size_t i = 0; i < fetch_tasks.size(); ++i)
+        {
+            if(is_async[i])
+                fetch_results[i] = futures[i].get();
+        }
+    }
+
+    for(size_t i = 0; i < fetch_tasks.size(); ++i)
+    {
+        if(fetch_results[i].ret == -1)
+        {
+            writeLog(0, "Skipping link without valid node info: " + fetch_tasks[i].url, LOG_LEVEL_WARNING);
+            skippedLinks++;
+            continue;
+        }
+        std::vector<Proxy> &dest = fetch_tasks[i].is_insert ? insert_nodes : nodes;
+        std::move(fetch_results[i].nodes.begin(), fetch_results[i].nodes.end(), std::back_inserter(dest));
+        if(!fetch_results[i].sub_info.empty())
+            subInfo = std::move(fetch_results[i].sub_info);
+    }
+    writeLog(0, "Subscription conversion summary: links=" + std::to_string(totalLinks) + ", succeeded=" + std::to_string(totalLinks - skippedLinks) + ", skipped=" + std::to_string(skippedLinks) + ", valid nodes=" + std::to_string(nodes.size() + insert_nodes.size()) + ".", LOG_LEVEL_INFO);
     //exit if found nothing
     if(nodes.empty() && insert_nodes.empty())
     {
         *status_code = 400;
-        return "No nodes were found!";
+        return "No valid nodes were found in any subscription link.";
     }
     if(!subInfo.empty() && argAppendUserinfo.get(global.appendUserinfo))
         response.headers.emplace("Subscription-UserInfo", subInfo);
@@ -759,6 +942,12 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
 
     //std::cerr<<"Generate target: ";
     proxy = parseProxy(global.proxyConfig);
+    auto get_base_template = [&](const std::string &path) -> std::string
+    {
+        if(base_template_future.valid())
+            return base_template_future.get();
+        return fetchFile(path, proxy, global.cacheConfig);
+    };
     switch(hash_(argTarget))
     {
     case "clash"_hash: case "clashr"_hash:
@@ -767,13 +956,11 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         response.headers["profile-update-interval"] = std::to_string(interval / 3600);
         if(ext.nodelist)
         {
-            YAML::Node yamlnode;
-            proxyToClash(nodes, yamlnode, dummy_group, argTarget == "clashr", ext);
-            output_content = YAML::Dump(yamlnode);
+            output_content = proxyToClash(nodes, "", dummy_ruleset, dummy_group, argTarget == "clashr", ext);
         }
         else
         {
-            if(render_template(fetchFile(lClashBase, proxy, global.cacheConfig), tpl_args, base_content, global.templatePath) != 0)
+            if(render_template(get_base_template(lClashBase), tpl_args, base_content, global.templatePath) != 0)
             {
                 *status_code = 400;
                 return base_content;
@@ -797,7 +984,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         }
         else
         {
-            if(render_template(fetchFile(lSurgeBase, proxy, global.cacheConfig), tpl_args, base_content, global.templatePath) != 0)
+            if(render_template(get_base_template(lSurgeBase), tpl_args, base_content, global.templatePath) != 0)
             {
                 *status_code = 400;
                 return base_content;
@@ -815,7 +1002,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     case "surfboard"_hash:
         writeLog(0, "Generate target: Surfboard", LOG_LEVEL_INFO);
 
-        if(render_template(fetchFile(lSurfboardBase, proxy, global.cacheConfig), tpl_args, base_content, global.templatePath) != 0)
+        if(render_template(get_base_template(lSurfboardBase), tpl_args, base_content, global.templatePath) != 0)
         {
             *status_code = 400;
             return base_content;
@@ -831,7 +1018,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     case "mellow"_hash:
         writeLog(0, "Generate target: Mellow", LOG_LEVEL_INFO);
 
-        if(render_template(fetchFile(lMellowBase, proxy, global.cacheConfig), tpl_args, base_content, global.templatePath) != 0)
+        if(render_template(get_base_template(lMellowBase), tpl_args, base_content, global.templatePath) != 0)
         {
             *status_code = 400;
             return base_content;
@@ -844,7 +1031,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
     case "sssub"_hash:
         writeLog(0, "Generate target: SS Subscription", LOG_LEVEL_INFO);
 
-        if(render_template(fetchFile(lSSSubBase, proxy, global.cacheConfig), tpl_args, base_content, global.templatePath) != 0)
+        if(render_template(get_base_template(lSSSubBase), tpl_args, base_content, global.templatePath) != 0)
         {
             *status_code = 400;
             return base_content;
@@ -887,7 +1074,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         writeLog(0, "Generate target: Quantumult", LOG_LEVEL_INFO);
         if(!ext.nodelist)
         {
-            if(render_template(fetchFile(lQuanBase, proxy, global.cacheConfig), tpl_args, base_content, global.templatePath) != 0)
+            if(render_template(get_base_template(lQuanBase), tpl_args, base_content, global.templatePath) != 0)
             {
                 *status_code = 400;
                 return base_content;
@@ -903,7 +1090,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         writeLog(0, "Generate target: Quantumult X", LOG_LEVEL_INFO);
         if(!ext.nodelist)
         {
-            if(render_template(fetchFile(lQuanXBase, proxy, global.cacheConfig), tpl_args, base_content, global.templatePath) != 0)
+            if(render_template(get_base_template(lQuanXBase), tpl_args, base_content, global.templatePath) != 0)
             {
                 *status_code = 400;
                 return base_content;
@@ -919,7 +1106,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         writeLog(0, "Generate target: Loon", LOG_LEVEL_INFO);
         if(!ext.nodelist)
         {
-            if(render_template(fetchFile(lLoonBase, proxy, global.cacheConfig), tpl_args, base_content, global.templatePath) != 0)
+            if(render_template(get_base_template(lLoonBase), tpl_args, base_content, global.templatePath) != 0)
             {
                 *status_code = 400;
                 return base_content;
@@ -941,7 +1128,7 @@ std::string subconverter(RESPONSE_CALLBACK_ARGS)
         writeLog(0, "Generate target: sing-box", LOG_LEVEL_INFO);
         if(!ext.nodelist)
         {
-            if(render_template(fetchFile(lSingBoxBase, proxy, global.cacheConfig), tpl_args, base_content, global.templatePath) != 0)
+            if(render_template(get_base_template(lSingBoxBase), tpl_args, base_content, global.templatePath) != 0)
             {
                 *status_code = 400;
                 return base_content;
@@ -1092,27 +1279,73 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS)
     parse_set.request_header = &request.headers;
     parse_set.sub_info = &subInfo;
     parse_set.authorized = !global.APIMode;
-    for(std::string &x : links)
+    // Kick off remote RULE-SET downloads upfront so they overlap with node link fetching.
+    string_array rule_entries;
+    ini.get_all("Rule", "{NONAME}", rule_entries);
+    std::map<std::string, std::shared_future<std::string>> surge_ruleset_futures;
+    std::string ruleset_proxy = parseProxy(global.proxyRuleset);
+    for(const std::string &x : rule_entries)
     {
-        //std::cerr<<"Fetching node data from url '"<<x<<"'."<<std::endl;
-        writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
-        if(addNodes(x, nodes, 0, parse_set) == -1)
+        if(!startsWith(x, "RULE-SET"))
+            continue;
+        string_array parts = split(x, ",");
+        if(parts.size() != 3 || surge_ruleset_futures.count(parts[1]))
+            continue;
+        std::string rurl = parts[1];
+        surge_ruleset_futures.emplace(rurl, submitFetchTask([rurl, ruleset_proxy]() {
+            return webGet(rurl, ruleset_proxy, global.cacheRuleset);
+        }).share());
+    }
+
+    size_t skippedLinks = 0;
+    if(links.size() <= 1)
+    {
+        for(std::string &x : links)
         {
-            if(global.skipFailedLinks)
-                writeLog(0, "The following link doesn't contain any valid node info: " + x, LOG_LEVEL_WARNING);
-            else
+            writeLog(0, "Fetching node data from url '" + x + "'.", LOG_LEVEL_INFO);
+            if(addNodes(x, nodes, 0, parse_set) == -1)
             {
-                *status_code = 400;
-                return "The following link doesn't contain any valid node info: " + x;
+                writeLog(0, "Skipping link without valid node info: " + x, LOG_LEVEL_WARNING);
+                skippedLinks++;
             }
         }
     }
+    else
+    {
+        struct SurgeLinkRes { int ret = 0; std::vector<Proxy> nodes; std::string sub_info; };
+        std::vector<std::future<SurgeLinkRes>> link_futures;
+        link_futures.reserve(links.size());
+        for(size_t i = 0; i < links.size(); ++i)
+        {
+            link_futures.emplace_back(submitFetchTask([&, i]() {
+                SurgeLinkRes res;
+                parse_settings local_ps = parse_set;
+                local_ps.sub_info = &res.sub_info;
+                writeLog(0, "Fetching node data from url '" + links[i] + "'.", LOG_LEVEL_INFO);
+                res.ret = addNodes(links[i], res.nodes, 0, local_ps);
+                return res;
+            }));
+        }
+        for(size_t i = 0; i < links.size(); ++i)
+        {
+            SurgeLinkRes res = link_futures[i].get();
+            if(res.ret == -1)
+            {
+                writeLog(0, "Skipping link without valid node info: " + links[i], LOG_LEVEL_WARNING);
+                skippedLinks++;
+                continue;
+            }
+            std::move(res.nodes.begin(), res.nodes.end(), std::back_inserter(nodes));
+        }
+    }
+
+    writeLog(0, "Surge configuration conversion summary: links=" + std::to_string(links.size()) + ", succeeded=" + std::to_string(links.size() - skippedLinks) + ", skipped=" + std::to_string(skippedLinks) + ", valid nodes=" + std::to_string(nodes.size()) + ".", LOG_LEVEL_INFO);
 
     //exit if found nothing
     if(nodes.empty())
     {
         *status_code = 400;
-        return "No nodes were found!";
+        return "No valid nodes were found in any subscription link.";
     }
 
     extra_settings ext;
@@ -1159,21 +1392,20 @@ std::string surgeConfToClash(RESPONSE_CALLBACK_ARGS)
         clash[proxygroup_name].push_back(singlegroup);
     }
 
-    eraseElements(dummy_str_array);
-    ini.get_all("Rule", "{NONAME}", dummy_str_array);
     YAML::Node rule;
     string_array strArray;
     std::string strLine;
     std::stringstream ss;
     std::string::size_type lineSize;
-    for(std::string &x : dummy_str_array)
+    for(std::string &x : rule_entries)
     {
         if(startsWith(x, "RULE-SET"))
         {
             strArray = split(x, ",");
             if(strArray.size() != 3)
                 continue;
-            content = webGet(strArray[1], proxy, global.cacheRuleset);
+            auto it = surge_ruleset_futures.find(strArray[1]);
+            content = (it != surge_ruleset_futures.end()) ? it->second.get() : std::string();
             if(content.empty())
                 continue;
 
@@ -1401,8 +1633,13 @@ std::string subInfoToMessage(std::string subinfo)
     if(expiry != 0)
     {
         char buffer[30];
-        struct tm *dt = localtime(&expiry);
-        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M", dt);
+        struct tm dt {};
+#ifdef _WIN32
+        localtime_s(&dt, &expiry);
+#else
+        localtime_r(&expiry, &dt);
+#endif
+        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M", &dt);
         expirydata.assign(buffer);
     }
     if(useddata == "N/A" && totaldata == "N/A" && expirydata == "N/A")
